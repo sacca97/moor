@@ -1,0 +1,299 @@
+// Package client attaches the local terminal to a session server.
+package client
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/sacca/moor/internal/protocol"
+)
+
+// Result says how an attachment ended.
+type Result int
+
+const (
+	Detached Result = iota // the user pressed Ctrl-\ twice
+	Exited                 // the shell exited; ExitCode is set
+	Lost                   // the connection broke or the client was signaled
+)
+
+// Outcome is returned by Attach.
+type Outcome struct {
+	Result   Result
+	ExitCode int
+}
+
+var ErrBusy = errors.New("session is already attached")
+
+// resetModes undoes terminal modes a program in the session may have enabled,
+// so the local terminal is usable after detaching: cursor visible, mouse
+// reporting, focus events, bracketed paste, modifyOtherKeys and the kitty
+// keyboard protocol off, normal cursor keys and keypad, default cursor shape
+// and attributes. All of these are harmless when the mode was not set.
+const resetModes = "\x1b[<99u\x1b[>4m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l" +
+	"\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[0m"
+
+// clearScreen homes the cursor and erases the screen and the scrollback.
+const clearScreen = "\x1b[H\x1b[2J\x1b[3J"
+
+// Attach connects the terminal on stdin/stdout to the session server
+// listening on sock and runs until detach, shell exit or disconnect. The
+// local terminal state is always restored before it returns.
+func Attach(sock string) (Outcome, error) {
+	in, out := os.Stdin, os.Stdout
+	fd := int(in.Fd())
+	if !term.IsTerminal(fd) {
+		return Outcome{}, errors.New("stdin is not a terminal")
+	}
+
+	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("connecting to session: %w", err)
+	}
+	defer conn.Close()
+
+	rows, cols := TermSize(fd)
+	if err := protocol.WriteFrame(conn, protocol.MsgHello, protocol.Resize{Rows: rows, Cols: cols}.Encode()); err != nil {
+		return Outcome{}, err
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	typ, payload, err := protocol.ReadFrame(conn)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("session did not answer: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+	if typ == protocol.MsgExit {
+		return Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)}, nil
+	}
+	if typ != protocol.MsgHello {
+		return Outcome{}, fmt.Errorf("unexpected message %d from session", typ)
+	}
+	hello, err := protocol.DecodeHelloReply(payload)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if hello.Status == protocol.HelloBusy {
+		return Outcome{}, ErrBusy
+	}
+
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return Outcome{}, err
+	}
+	modes := &modeTracker{}
+	restore := sync.OnceFunc(func() {
+		reset := resetModes
+		if modes.altScreen {
+			// Pop the alternate screen's keyboard flags, leave it, then
+			// pop the main screen's.
+			reset = "\x1b[<99u\x1b[?1049l" + reset
+		}
+		out.WriteString(reset)
+		term.Restore(fd, oldState)
+	})
+	defer restore()
+
+	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4)}
+
+	// Start from a blank screen and scrollback, so the terminal shows only
+	// the session: its buffered output is replayed into the empty
+	// scrollback. Then make sure terminal answers to any queries in the
+	// replay are not mistaken for typing.
+	out.WriteString(clearScreen)
+	for remaining := int(hello.ReplayLen); remaining > 0; {
+		typ, payload, err := protocol.ReadFrame(conn)
+		if err != nil {
+			return Outcome{Result: Lost}, nil
+		}
+		switch typ {
+		case protocol.MsgOutput:
+			a.write(payload)
+			remaining -= len(payload)
+		case protocol.MsgExit:
+			return Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)}, nil
+		}
+	}
+	if hello.ReplayLen > 0 {
+		a.drain.start()
+		out.Write(drainQuery)
+	}
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	defer signal.Stop(sigs)
+
+	stop := make(chan struct{})
+	defer close(stop)
+	watchResize(fd, func(rows, cols uint16) {
+		a.send(protocol.MsgResize, protocol.Resize{Rows: rows, Cols: cols}.Encode())
+	}, stop)
+	// The terminal may have been resized between the hello and raw mode.
+	if r, c := TermSize(fd); r != rows || c != cols {
+		a.send(protocol.MsgResize, protocol.Resize{Rows: r, Cols: c}.Encode())
+	}
+
+	go a.readServer()
+	go a.readInput(in)
+
+	select {
+	case o := <-a.done:
+		if o.Result == Detached {
+			a.send(protocol.MsgDetach, nil)
+		}
+		return o, nil
+	case <-sigs:
+		return Outcome{Result: Lost}, nil
+	}
+}
+
+type attachment struct {
+	conn  net.Conn
+	out   *os.File
+	modes *modeTracker
+	done  chan Outcome
+
+	sendMu sync.Mutex
+
+	// mu guards filter, drain and timer.
+	mu     sync.Mutex
+	filter detachFilter
+	drain  replyDrain
+	timer  *time.Timer
+}
+
+func (a *attachment) send(typ byte, payload []byte) {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := protocol.WriteFrame(a.conn, typ, payload); err != nil {
+		a.finish(Outcome{Result: Lost})
+	}
+}
+
+func (a *attachment) finish(o Outcome) {
+	select {
+	case a.done <- o:
+	default:
+	}
+}
+
+func (a *attachment) write(p []byte) {
+	a.modes.observe(p)
+	a.out.Write(p)
+}
+
+func (a *attachment) readServer() {
+	for {
+		typ, payload, err := protocol.ReadFrame(a.conn)
+		if err != nil {
+			a.finish(Outcome{Result: Lost})
+			return
+		}
+		switch typ {
+		case protocol.MsgOutput:
+			a.write(payload)
+		case protocol.MsgExit:
+			a.finish(Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)})
+			return
+		}
+	}
+}
+
+func (a *attachment) readInput(in *os.File) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := in.Read(buf)
+		if n > 0 && a.handleInput(buf[:n]) {
+			a.finish(Outcome{Result: Detached})
+			return
+		}
+		if err != nil {
+			a.finish(Outcome{Result: Lost})
+			return
+		}
+	}
+}
+
+// handleInput filters keyboard input and forwards it. It returns true on
+// Ctrl-\ Ctrl-\.
+func (a *attachment) handleInput(p []byte) bool {
+	a.mu.Lock()
+	p = a.drain.filter(p)
+	epoch := a.filter.epoch
+	fwd, detach := a.filter.feed(p)
+	if !detach && a.filter.pending() && a.filter.epoch != epoch {
+		a.armTimer(a.filter.epoch)
+	}
+	a.mu.Unlock()
+	if len(fwd) > 0 {
+		a.send(protocol.MsgInput, fwd)
+	}
+	return detach
+}
+
+// armTimer releases a held-back Ctrl-\ after detachTimeout, unless the
+// filter has moved on to a newer pending state by then. Caller holds a.mu.
+func (a *attachment) armTimer(epoch int) {
+	if a.timer != nil {
+		a.timer.Stop()
+	}
+	a.timer = time.AfterFunc(detachTimeout, func() {
+		a.mu.Lock()
+		var fwd []byte
+		if a.filter.epoch == epoch && a.filter.pending() {
+			fwd = a.filter.flush()
+		}
+		a.mu.Unlock()
+		if len(fwd) > 0 {
+			a.send(protocol.MsgInput, fwd)
+		}
+	})
+}
+
+// modeTracker follows whether the session's output has switched the terminal
+// to the alternate screen, so detaching can switch it back. Leaving the
+// alternate screen when it is not active would move the cursor, so this is
+// the one mode that is tracked rather than reset unconditionally.
+type modeTracker struct {
+	altScreen bool
+	tail      []byte // end of the previous chunk, for sequences split across writes
+}
+
+var (
+	altOn  = [][]byte{[]byte("\x1b[?1049h"), []byte("\x1b[?1047h"), []byte("\x1b[?47h")}
+	altOff = [][]byte{[]byte("\x1b[?1049l"), []byte("\x1b[?1047l"), []byte("\x1b[?47l")}
+)
+
+func (m *modeTracker) observe(p []byte) {
+	// Fast path: no ESC in the chunk or the kept tail means no sequence can
+	// start or finish here. This covers most output, including big replays.
+	if bytes.IndexByte(p, esc) < 0 && bytes.IndexByte(m.tail, esc) < 0 {
+		return
+	}
+	data := append(m.tail, p...)
+	last, on := -1, false
+	for _, seq := range altOn {
+		if i := bytes.LastIndex(data, seq); i > last {
+			last, on = i, true
+		}
+	}
+	for _, seq := range altOff {
+		if i := bytes.LastIndex(data, seq); i > last {
+			last, on = i, false
+		}
+	}
+	if last >= 0 {
+		m.altScreen = on
+	}
+	keep := min(len(data), 7)
+	m.tail = append(m.tail[:0:0], data[len(data)-keep:]...)
+}
