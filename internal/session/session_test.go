@@ -59,6 +59,16 @@ func TestAutoName(t *testing.T) {
 	}
 }
 
+func TestDirName(t *testing.T) {
+	for dir, want := range map[string]string{
+		"/home/u/src/moor": "moor", "/home/u/My Proj": "My-Proj", "/home/u/2024": "dir-2024", "/": "shell",
+	} {
+		if got := DirName(dir); got != want {
+			t.Errorf("DirName(%q) = %q, want %q", dir, got, want)
+		}
+	}
+}
+
 func TestRemoveChecksOwner(t *testing.T) {
 	useTempRoot(t)
 	EnsureRoot()

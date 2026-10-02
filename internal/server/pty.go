@@ -8,6 +8,8 @@ import (
 
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
+
+	"github.com/sacca/moor/internal/protocol"
 )
 
 // ShellPath returns the user's shell: $SHELL, or /bin/sh.
@@ -43,22 +45,44 @@ func startShell(id int, name, dir string, rows, cols uint16) (*os.File, *exec.Cm
 	return ptmx, cmd, nil
 }
 
+// ptyControl runs f with the PTY master's descriptor. It goes through
+// SyscallConn rather than Fd, because Fd switches the file to blocking mode,
+// after which closing it can no longer interrupt a pending Read: the master
+// would stay open and the hangup that closing it causes would never happen.
+func ptyControl(ptmx *os.File, f func(fd int)) {
+	if rc, err := ptmx.SyscallConn(); err == nil {
+		rc.Control(func(fd uintptr) { f(int(fd)) })
+	}
+}
+
+// foregroundPgrp returns the PTY's foreground process group, or 0.
+func foregroundPgrp(ptmx *os.File) (pgrp int) {
+	ptyControl(ptmx, func(fd int) {
+		if p, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP); err == nil && p > 0 {
+			pgrp = p
+		}
+	})
+	return pgrp
+}
+
 // setSize applies a client's terminal size to the PTY, which makes the kernel
 // deliver SIGWINCH to the foreground process group. When force is set and the
 // size is unchanged, SIGWINCH is sent anyway so full-screen programs redraw
 // for a newly attached client.
-func setSize(ptmx *os.File, rows, cols uint16, force bool) {
-	if rows == 0 || cols == 0 {
+func setSize(ptmx *os.File, size protocol.Resize, force bool) {
+	if size.Rows == 0 || size.Cols == 0 {
 		return
 	}
-	cur, err := pty.GetsizeFull(ptmx)
-	if err == nil && cur.Rows == rows && cur.Cols == cols {
-		if force {
-			if pgrp, err := unix.IoctlGetInt(int(ptmx.Fd()), unix.TIOCGPGRP); err == nil && pgrp > 0 {
-				syscall.Kill(-pgrp, syscall.SIGWINCH)
+	want := unix.Winsize{Row: size.Rows, Col: size.Cols, Xpixel: size.XPixel, Ypixel: size.YPixel}
+	ptyControl(ptmx, func(fd int) {
+		if cur, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ); err == nil && *cur == want {
+			if force {
+				if pgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP); err == nil && pgrp > 0 {
+					syscall.Kill(-pgrp, syscall.SIGWINCH)
+				}
 			}
+			return
 		}
-		return
-	}
-	pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols})
+		unix.IoctlSetWinsize(fd, unix.TIOCSWINSZ, &want)
+	})
 }

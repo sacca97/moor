@@ -95,6 +95,18 @@ func AutoName(command string) string {
 	return name
 }
 
+// DirName derives a session name from a directory: its base name, cleaned up.
+func DirName(dir string) string {
+	name := Sanitize(path.Base(dir))
+	if name == "" {
+		return defaultName
+	}
+	if _, err := strconv.Atoi(name); err == nil {
+		name = "dir-" + name
+	}
+	return name
+}
+
 // IsDefaultName reports whether name is the placeholder given to sessions
 // with no explicit name and no command ("shell", "shell-1", ...). Such names
 // carry no information, so they are left out of the prompt marker and of

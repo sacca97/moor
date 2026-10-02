@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 var binary string
@@ -39,6 +40,7 @@ type env struct {
 	t    *testing.T
 	root string
 	vars []string
+	cwd  string // directory moor runs in; empty means the test's own
 }
 
 func newEnv(t *testing.T) *env {
@@ -64,8 +66,13 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-// killAll terminates any session servers the test left behind.
+// killAll terminates every session the test left behind, shells included,
+// and waits until they are gone: a shell that outlives its server would
+// otherwise write its history into the test's temporary directory while it is
+// being removed.
 func (e *env) killAll() {
+	type proc struct{ server, shell int }
+	var procs []proc
 	dirs, _ := filepath.Glob(filepath.Join(e.root, "moor", "[0-9]*"))
 	for _, d := range dirs {
 		data, err := os.ReadFile(filepath.Join(d, "session.json"))
@@ -73,18 +80,51 @@ func (e *env) killAll() {
 			continue
 		}
 		var m struct {
-			PID int `json:"pid"`
+			PID      int `json:"pid"`
+			ShellPID int `json:"shell_pid"`
 		}
-		if json.Unmarshal(data, &m) == nil && m.PID > 0 {
-			syscall.Kill(m.PID, syscall.SIGKILL)
+		if json.Unmarshal(data, &m) == nil {
+			procs = append(procs, proc{m.PID, m.ShellPID})
 		}
 	}
+	alive := func(pid int) bool { return pid > 0 && syscall.Kill(pid, 0) == nil }
+	wait := func(d time.Duration) bool {
+		for end := time.Now().Add(d); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
+			done := true
+			for _, p := range procs {
+				done = done && !alive(p.server) && !alive(p.shell)
+			}
+			if done {
+				return true
+			}
+		}
+		return false
+	}
+	// Ask first, so servers hang up their shells and remove their directories.
+	for _, p := range procs {
+		if p.server > 0 {
+			syscall.Kill(p.server, syscall.SIGCONT) // it may be stopped by a test
+			syscall.Kill(p.server, syscall.SIGTERM)
+		}
+	}
+	if wait(3 * time.Second) {
+		return
+	}
+	for _, p := range procs {
+		syscall.Kill(p.server, syscall.SIGKILL)
+		if p.shell > 0 {
+			syscall.Kill(-p.shell, syscall.SIGKILL)
+			syscall.Kill(p.shell, syscall.SIGKILL)
+		}
+	}
+	wait(2 * time.Second)
 }
 
 // run runs moor without a terminal and returns its combined output.
 func (e *env) run(args ...string) (string, error) {
 	cmd := exec.Command(binary, args...)
 	cmd.Env = e.vars
+	cmd.Dir = e.cwd
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -117,14 +157,24 @@ type termClient struct {
 
 func (e *env) attachTerm(rows, cols uint16, args ...string) *termClient {
 	e.t.Helper()
+	return e.startTerm(true, rows, cols, args...)
+}
+
+// startTerm runs moor on a pty. With drain false nothing reads the pty, like
+// a terminal that has stopped consuming output.
+func (e *env) startTerm(drain bool, rows, cols uint16, args ...string) *termClient {
+	e.t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Env = e.vars
+	cmd.Dir = e.cwd
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: rows, Cols: cols})
 	if err != nil {
 		e.t.Fatal(err)
 	}
 	c := &termClient{t: e.t, ptmx: ptmx, cmd: cmd, exited: make(chan struct{})}
-	go c.readLoop()
+	if drain {
+		go c.readLoop()
+	}
 	go func() {
 		cmd.Wait()
 		close(c.exited)
@@ -195,6 +245,27 @@ func (c *termClient) contains(substr string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.Contains(c.output.String(), substr)
+}
+
+// cooked reports whether the terminal is in its normal line-editing state
+// (canonical mode with echo), as opposed to the raw mode moor runs in.
+func (c *termClient) cooked() bool {
+	raw, err := c.ptmx.SyscallConn()
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	var t *unix.Termios
+	raw.Control(func(fd uintptr) { t, err = unix.IoctlGetTermios(int(fd), getTermios) })
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return t.Lflag&unix.ICANON != 0 && t.Lflag&unix.ECHO != 0
+}
+
+func (c *termClient) count(substr string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Count(c.output.String(), substr)
 }
 
 func (c *termClient) waitExit() {
@@ -374,6 +445,8 @@ func TestDetachKeyEncodings(t *testing.T) {
 		"legacy":          "\x1c\x1c",
 		"kitty":           "\x1b[92;5u\x1b[92;5:1u",
 		"modifyOtherKeys": "\x1b[27;5;92~\x1b[27;5;92~",
+		"tmux":            "\x02d",
+		"tmuxkitty":       "\x1b[98;5u\x1b[100u",
 	} {
 		c := e.attachTerm(24, 80, "-n", name)
 		c.expect("dsh$ ")
@@ -381,8 +454,8 @@ func TestDetachKeyEncodings(t *testing.T) {
 		c.expect("[moor: detached")
 		c.waitExit()
 	}
-	if got := strings.Count(e.ps(), "detached"); got != 3 {
-		t.Fatalf("want 3 live detached sessions:\n%s", e.ps())
+	if got := strings.Count(e.ps(), "detached"); got != 5 {
+		t.Fatalf("want 5 live detached sessions:\n%s", e.ps())
 	}
 }
 
@@ -452,6 +525,122 @@ func TestSlowReplayDoesNotStallSession(t *testing.T) {
 	}
 }
 
+// However an attachment ends, the terminal must be left usable: cooked mode
+// with echo, cursor visible.
+func TestTerminalRestoredOnEveryExit(t *testing.T) {
+	e := newEnv(t)
+	killServer := func() { syscall.Kill(e.serverPID(0), syscall.SIGKILL) }
+	for name, s := range map[string]struct {
+		end    func(c *termClient)
+		expect string
+	}{
+		"detach":         {func(c *termClient) { c.send("\x1c\x1c") }, "detached from"},
+		"shell exit":     {func(c *termClient) { c.send("exit\r") }, "exited"},
+		"moor kill":      {func(c *termClient) { e.mustRun("kill", "0") }, "exited"},
+		"server dies":    {func(c *termClient) { killServer() }, "lost connection"},
+		"client SIGTERM": {func(c *termClient) { c.cmd.Process.Signal(syscall.SIGTERM) }, "lost connection"},
+		"client SIGHUP":  {func(c *termClient) { c.cmd.Process.Signal(syscall.SIGHUP) }, "lost connection"},
+		"client SIGINT":  {func(c *termClient) { c.cmd.Process.Signal(syscall.SIGINT) }, "lost connection"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e.t = t
+			// Start from nothing, so the session under test is always 0.
+			e.killAll()
+			e.mustRun("ps")
+			c := e.attachTerm(24, 80)
+			c.expect("dsh$ ")
+			if c.cooked() {
+				t.Fatal("terminal should be raw while attached")
+			}
+			s.end(c)
+			c.expect(s.expect)
+			c.waitExit()
+			if !c.cooked() {
+				t.Fatal("terminal left in raw mode")
+			}
+			if !c.contains("\x1b[?25h") {
+				t.Fatal("cursor not re-shown")
+			}
+		})
+	}
+}
+
+// A termination signal must still restore the terminal while the client is
+// stuck writing a large replay to a terminal that is not reading.
+func TestSignalWhileTerminalIsStalled(t *testing.T) {
+	e := newEnv(t)
+	a := e.attachTerm(24, 80, "-n", "big")
+	a.expect("dsh$ ")
+	a.send("head -c 12000000 /dev/zero | tr '\\0' x; echo flooded-$((1+1))\r")
+	a.expect("flooded-2")
+	a.detach()
+
+	c := e.startTerm(false, 24, 80, "attach", "big")
+	for i := 0; i < 100 && c.cooked(); i++ { // wait for raw mode
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.cooked() {
+		t.Fatal("client never went raw")
+	}
+	time.Sleep(300 * time.Millisecond) // now blocked writing the replay
+	c.cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-c.exited:
+	case <-time.After(6 * time.Second):
+		t.Fatal("client did not exit on SIGTERM")
+	}
+	if !c.cooked() {
+		t.Fatal("terminal left in raw mode")
+	}
+}
+
+// Resizing: a reattach applies the new size at once and makes the foreground
+// program notice even when the size did not change.
+func TestReattachResizesAndSignalsApplication(t *testing.T) {
+	e := newEnv(t)
+	c := e.attachTerm(24, 80, "-n", "w")
+	c.expect("dsh$ ")
+	c.send(`sh -c 'trap "echo size-\$(stty size)" WINCH; echo ready; while :; do sleep 0.1; done'` + "\r")
+	c.expect("ready")
+	c.detach()
+
+	c = e.attachTerm(30, 100, "attach", "w")
+	c.expect("size-30 100")
+	c.detach()
+
+	// Same size again: the replay shows the earlier line once, and the
+	// forced SIGWINCH adds a second.
+	c = e.attachTerm(30, 100, "attach", "w")
+	deadline := time.Now().Add(5 * time.Second)
+	for c.count("size-30 100") < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := c.count("size-30 100"); n != 2 {
+		t.Fatalf("size-30 100 seen %d times, want 2 (replay + redraw signal)", n)
+	}
+
+	// A live resize while attached, with a pixel size.
+	if err := pty.Setsize(c.ptmx, &pty.Winsize{Rows: 50, Cols: 120, X: 960, Y: 800}); err != nil {
+		t.Fatal(err)
+	}
+	c.expect("size-50 120")
+}
+
+func TestPixelSizeReachesSession(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not installed")
+	}
+	e := newEnv(t)
+	c := e.attachTerm(24, 80)
+	c.expect("dsh$ ")
+	if err := pty.Setsize(c.ptmx, &pty.Winsize{Rows: 24, Cols: 80, X: 640, Y: 480}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	c.send(`python3 -c "import fcntl,termios,struct;print('ws', struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8))))"` + "\r")
+	c.expect("ws (24, 80, 640, 480)")
+}
+
 func TestStartInjectsCommandAndKeepsShell(t *testing.T) {
 	e := newEnv(t)
 	c := e.attachTerm(24, 80, "start", "sh", "-c", "echo injected-$((40+2))")
@@ -466,6 +655,71 @@ func TestStartInjectsCommandAndKeepsShell(t *testing.T) {
 	c.waitExit()
 }
 
+// "--" marks where the command begins, so its own options are left alone.
+func TestCommandBoundary(t *testing.T) {
+	e := newEnv(t)
+	if out := e.mustRun("run", "--", "sleep", "60"); !strings.Contains(out, "started session 0 (sleep)") {
+		t.Fatalf("run -- output %q", out)
+	}
+	if out := e.mustRun("run", "-n", "build", "--", "sh", "-c", "echo it-works-$((20+22)); sleep 60"); !strings.Contains(out, "(build)") {
+		t.Fatalf("run -n output %q", out)
+	}
+	// Options after the command's name are the command's, not moor's.
+	if out := e.mustRun("run", "sleep", "-n", "60"); !strings.Contains(out, "(sleep-1)") {
+		t.Fatalf("run output %q", out)
+	}
+	for _, bad := range [][]string{{"run", "-x", "sleep"}, {"-n", "a", "run", "-n", "b", "--", "sleep", "9"}, {"run", "-n"}} {
+		if out, err := e.run(bad...); err == nil {
+			t.Fatalf("moor %v succeeded: %s", bad, out)
+		}
+	}
+	c := e.attachTerm(24, 80, "start", "-n", "shown", "--", "echo", "boundary-$((1+1))")
+	c.expect("boundary-")
+	c.detach()
+	c = e.attachTerm(24, 80, "attach", "build")
+	c.expect("it-works-42")
+}
+
+// Programs in a session must see default signal dispositions, so Ctrl-C and
+// hangups work as in any terminal.
+func TestCtrlCInterruptsForegroundProgram(t *testing.T) {
+	e := newEnv(t)
+	c := e.attachTerm(24, 80)
+	c.expect("dsh$ ")
+	c.send("sleep 4322\r")
+	time.Sleep(300 * time.Millisecond)
+	c.send("\x03")
+	c.send("echo back-$((1+1))\r")
+	c.expect("back-2")
+}
+
+// Ending a session must take whatever it is running with it, whether or not
+// the shell passes SIGHUP on to its jobs (bash started as sh does not).
+func TestKillStopsForegroundJob(t *testing.T) {
+	e := newEnv(t)
+	e.mustRun("run", "sleep", "4321")
+	time.Sleep(500 * time.Millisecond) // typed into the shell once it is up
+	running := func() bool {
+		out, _ := exec.Command("ps", "-A", "-o", "args=").Output()
+		return strings.Contains("\n"+string(out), "\nsleep 4321")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !running() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !running() {
+		t.Fatal("the command never started")
+	}
+	e.mustRun("kill", "0")
+	deadline = time.Now().Add(5 * time.Second)
+	for running() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if running() {
+		t.Fatal("sleep survived the end of its session")
+	}
+}
+
 func TestNamesAndIDs(t *testing.T) {
 	e := newEnv(t)
 	e.mustRun("-n", "project", "run", "cd / && sleep 60")
@@ -475,7 +729,7 @@ func TestNamesAndIDs(t *testing.T) {
 	e.mustRun("run")
 	e.mustRun("run")
 	ps := e.ps()
-	for id, want := range map[int]string{0: "0 project ", 1: "1 shell ", 2: "2 shell-1 "} {
+	for id, want := range map[int]string{0: "0 project ", 1: "1 — ", 2: "2 — "} {
 		if l := psLine(ps, id); !strings.HasPrefix(l, want) {
 			t.Fatalf("session %d: ps line %q, want prefix %q\n%s", id, l, want, ps)
 		}
@@ -490,6 +744,100 @@ func TestNamesAndIDs(t *testing.T) {
 	e.mustRun("kill", "project")
 	if l := psLine(e.ps(), 0); l != "" {
 		t.Fatalf("killed session still listed: %q", l)
+	}
+}
+
+func TestRenameAndPsColumns(t *testing.T) {
+	e := newEnv(t)
+	e.mustRun("run", "cd /usr && sleep 60")
+	e.mustRun("-n", "taken", "run")
+	if out := e.mustRun("rename", "0", "renamed"); !strings.Contains(out, "renamed session 0 to renamed") {
+		t.Fatalf("rename output %q", out)
+	}
+	for _, bad := range [][]string{{"rename", "0", "taken"}, {"rename", "0", "7"}, {"rename", "0", "has space"}, {"rename", "nope", "x"}} {
+		if out, err := e.run(bad...); err == nil {
+			t.Fatalf("moor %v succeeded: %s", bad, out)
+		}
+	}
+	// The command is typed into the shell once it is up; wait for its cd.
+	var ps string
+	for i := 0; i < 100; i++ {
+		ps = e.ps()
+		if strings.HasSuffix(psLine(ps, 0), " /usr") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if h := strings.Join(strings.Fields(strings.SplitN(ps, "\n", 2)[0]), " "); h != "ID NAME STATE PID AGE CWD" {
+		t.Fatalf("unexpected ps header %q", h)
+	}
+	f := strings.Fields(psLine(ps, 0))
+	if len(f) != 6 || f[1] != "renamed" || f[2] != "detached" || !strings.HasSuffix(f[4], "s") || f[5] != "/usr" {
+		t.Fatalf("ps line %q", psLine(ps, 0))
+	}
+	// The new name works everywhere the old one did.
+	e.mustRun("kill", "renamed")
+}
+
+func TestAttachWithoutArgument(t *testing.T) {
+	e := newEnv(t)
+	if out, err := e.run("attach"); err == nil || !strings.Contains(out, "no sessions") {
+		t.Fatalf("attach with no sessions: %v, %q", err, out)
+	}
+	e.mustRun("-n", "only", "run")
+	c := e.attachTerm(24, 80, "attach")
+	c.expect("dsh$ ")
+	c.detach()
+
+	e.mustRun("run")
+	out, err := e.run("attach")
+	if err == nil || !strings.Contains(out, "several sessions") || !strings.Contains(out, "only") {
+		t.Fatalf("attach with two sessions: %v, %q", err, out)
+	}
+}
+
+func TestCurrentDirectorySession(t *testing.T) {
+	e := newEnv(t)
+	proj := filepath.Join(e.root, "My Proj")
+	other := filepath.Join(e.root, "other")
+	os.Mkdir(proj, 0o755)
+	os.Mkdir(other, 0o755)
+
+	// Nothing yet: "moor ." creates a session named after the directory.
+	e.cwd = proj
+	c := e.attachTerm(24, 80, ".")
+	c.expect("dsh$ ")
+	if l := psLine(e.ps(), 0); !strings.HasPrefix(l, "0 My-Proj attached ") {
+		t.Fatalf("ps line %q", l)
+	}
+	c.detach()
+
+	// A second run attaches to it instead of creating another, whether
+	// spelled "." or "cwd", and -r watches.
+	c = e.attachTerm(24, 80, "cwd")
+	c.expect("dsh$ ")
+	w := e.attachTerm(24, 80, "-r", ".")
+	w.expect("dsh$ ")
+	if got := strings.Count(e.ps(), "\n"); got != 2 { // header + one session
+		t.Fatalf("expected a single session:\n%s", e.ps())
+	}
+	w.detach()
+	c.detach()
+
+	// Other directories get their own session; two in one directory are
+	// ambiguous.
+	e.cwd = other
+	e.mustRun("run")
+	if l := psLine(e.ps(), 1); !strings.HasPrefix(l, "1 — ") { // unnamed: not the "My-Proj" one
+		t.Fatalf("ps line %q", l)
+	}
+	e.mustRun("run")
+	out, err := e.run(".")
+	if err == nil || !strings.Contains(out, "several sessions started in") {
+		t.Fatalf("moor . with two sessions: %v, %q", err, out)
+	}
+	if out, err := e.run("-n", "x", "."); err == nil {
+		t.Fatalf("-n with an existing session accepted: %q", out)
 	}
 }
 
@@ -566,6 +914,21 @@ func TestStaleSessionCleanup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.root, "moor", "0")); !os.IsNotExist(err) {
 		t.Fatal("stale directory not removed")
 	}
+}
+
+func (e *env) serverPID(id int) int {
+	e.t.Helper()
+	data, err := os.ReadFile(filepath.Join(e.root, "moor", fmt.Sprint(id), "session.json"))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var m struct {
+		PID int `json:"pid"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil || m.PID <= 0 {
+		e.t.Fatalf("no server pid in %s", data)
+	}
+	return m.PID
 }
 
 // setVar overrides one environment variable for moor and its shells.

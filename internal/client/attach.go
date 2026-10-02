@@ -22,7 +22,7 @@ import (
 type Result int
 
 const (
-	Detached Result = iota // the user pressed Ctrl-\ twice
+	Detached Result = iota // the user pressed a detach key
 	Exited                 // the shell exited; ExitCode is set
 	Lost                   // the connection broke or the client was signaled
 )
@@ -42,13 +42,21 @@ const (
 	readOnlyTitle = "\x1b]2;moor: read-only\x07"
 )
 
+// signalGrace is how long a termination signal waits for a clean shutdown.
+const signalGrace = 2 * time.Second
+
 // resetModes undoes terminal modes a program in the session may have enabled,
 // so the local terminal is usable after detaching: cursor visible, mouse
 // reporting, focus events, bracketed paste, modifyOtherKeys and the kitty
-// keyboard protocol off, normal cursor keys and keypad, default cursor shape
-// and attributes. All of these are harmless when the mode was not set.
+// keyboard protocol off, synchronized output off (a terminal stuck in it stops
+// redrawing), normal cursor keys and keypad, auto-wrap on, insert mode and
+// reverse video off, the default character set, no open hyperlink, default
+// cursor shape and attributes. All of these are harmless when the mode was
+// not set. Modes that would move the cursor (origin mode, scroll region) are
+// deliberately left alone.
 const resetModes = "\x1b[<99u\x1b[>4m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l" +
-	"\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[0 q\x1b[?25h\x1b[0m"
+	"\x1b[?1004l\x1b[?2004l\x1b[?2026l\x1b[?1007l\x1b[?1l\x1b>\x1b[?7h\x1b[4l\x1b[?5l\x0f\x1b(B" +
+	"\x1b]8;;\x1b\\\x1b[0 q\x1b[?25h\x1b[0m"
 
 // clearScreen homes the cursor and erases the screen and the scrollback.
 const clearScreen = "\x1b[H\x1b[2J\x1b[3J"
@@ -73,9 +81,9 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	}
 	defer conn.Close()
 
-	rows, cols := TermSize(fd)
+	size := TermSize(fd)
 	if err := protocol.WriteFrame(conn, protocol.MsgHello,
-		protocol.Hello{Rows: rows, Cols: cols, ReadOnly: readOnly}.Encode()); err != nil {
+		protocol.Hello{Size: size, ReadOnly: readOnly}.Encode()); err != nil {
 		return Outcome{}, err
 	}
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -94,6 +102,12 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
+
+	// From here on the terminal is changed, so every way out must restore
+	// it. Signals are caught before the terminal is touched; see below.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+	defer signal.Stop(sigs)
 
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -116,13 +130,35 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 		out.WriteString(reset)
 		term.Restore(fd, oldState)
 	})
+	a.restore = restore
 	defer restore()
+
+	// A termination signal closes the connection, which ends the attachment
+	// through the normal paths, deferred restore included. If the process is
+	// stuck writing to a terminal that does not drain, that cannot happen, so
+	// after a grace period the terminal mode is restored and we exit anyway.
+	stopSigs := make(chan struct{})
+	defer close(stopSigs)
+	go func() {
+		select {
+		case <-sigs:
+			conn.Close()
+		case <-stopSigs:
+			return
+		}
+		select {
+		case <-time.After(signalGrace):
+			term.Restore(fd, oldState)
+			os.Exit(1)
+		case <-stopSigs:
+		}
+	}()
 
 	// Start from a blank screen and scrollback, so the terminal shows only
 	// the session: its buffered output is replayed into the empty
 	// scrollback. Then make sure terminal answers to any queries in the
 	// replay are not mistaken for typing.
-	out.WriteString(clearScreen)
+	a.emit([]byte(clearScreen))
 	a.setRole(hello.Role)
 	for remaining := int(hello.ReplayLen); remaining > 0; {
 		typ, payload, err := protocol.ReadFrame(conn)
@@ -146,32 +182,25 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 		out.Write(drainQuery)
 	}
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
-	defer signal.Stop(sigs)
-
 	stop := make(chan struct{})
 	defer close(stop)
-	watchResize(fd, func(rows, cols uint16) {
-		a.send(protocol.MsgResize, protocol.Resize{Rows: rows, Cols: cols}.Encode())
+	watchResize(fd, func(r protocol.Resize) {
+		defer a.recoverRestore()
+		a.send(protocol.MsgResize, r.Encode())
 	}, stop)
 	// The terminal may have been resized between the hello and raw mode.
-	if r, c := TermSize(fd); r != rows || c != cols {
-		a.send(protocol.MsgResize, protocol.Resize{Rows: r, Cols: c}.Encode())
+	if now := TermSize(fd); now != size {
+		a.send(protocol.MsgResize, now.Encode())
 	}
 
 	go a.readServer()
 	go a.readInput(in)
 
-	select {
-	case o := <-a.done:
-		if o.Result == Detached {
-			a.send(protocol.MsgDetach, nil)
-		}
-		return o, nil
-	case <-sigs:
-		return Outcome{Result: Lost}, nil
+	o := <-a.done
+	if o.Result == Detached {
+		a.send(protocol.MsgDetach, nil)
 	}
+	return o, nil
 }
 
 type attachment struct {
@@ -179,6 +208,9 @@ type attachment struct {
 	out   *os.File
 	modes *modeTracker
 	done  chan Outcome
+
+	// restore puts the terminal back; see recoverRestore.
+	restore func()
 
 	sendMu sync.Mutex
 
@@ -199,6 +231,16 @@ type attachment struct {
 	filter detachFilter
 	drain  replyDrain
 	timer  *time.Timer
+}
+
+// recoverRestore is deferred at the top of every goroutine: a panic there
+// would kill the process without running Attach's deferred restore, leaving
+// the terminal raw. It restores the terminal and lets the panic go on.
+func (a *attachment) recoverRestore() {
+	if r := recover(); r != nil {
+		a.restore()
+		panic(r)
+	}
 }
 
 func (a *attachment) send(typ byte, payload []byte) {
@@ -259,6 +301,7 @@ func (a *attachment) emit(p []byte) {
 }
 
 func (a *attachment) readServer() {
+	defer a.recoverRestore()
 	for {
 		typ, payload, err := protocol.ReadFrame(a.conn)
 		if err != nil {
@@ -280,6 +323,7 @@ func (a *attachment) readServer() {
 }
 
 func (a *attachment) readInput(in *os.File) {
+	defer a.recoverRestore()
 	buf := make([]byte, 4096)
 	for {
 		n, err := in.Read(buf)
@@ -295,7 +339,7 @@ func (a *attachment) readInput(in *os.File) {
 }
 
 // handleInput filters keyboard input and forwards it. It returns true on
-// Ctrl-\ Ctrl-\.
+// a detach sequence.
 func (a *attachment) handleInput(p []byte) bool {
 	a.mu.Lock()
 	p = a.drain.filter(p)
@@ -309,13 +353,14 @@ func (a *attachment) handleInput(p []byte) bool {
 	return detach
 }
 
-// armTimer releases a held-back Ctrl-\ after detachTimeout, unless the
+// armTimer releases a held-back Ctrl-\ or Ctrl-b after detachTimeout, unless the
 // filter has moved on to a newer pending state by then. Caller holds a.mu.
 func (a *attachment) armTimer(epoch int) {
 	if a.timer != nil {
 		a.timer.Stop()
 	}
 	a.timer = time.AfterFunc(detachTimeout, func() {
+		defer a.recoverRestore()
 		a.mu.Lock()
 		var fwd []byte
 		if a.filter.epoch == epoch && a.filter.pending() {

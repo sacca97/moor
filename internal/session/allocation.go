@@ -16,6 +16,9 @@ import (
 type CreateOptions struct {
 	// Name is an explicit session name. Empty means derive one.
 	Name string
+	// DefaultName is the name to use, made unique, when Name is empty;
+	// without it the name is derived from Command.
+	DefaultName string
 	// Command is injected into the shell after it starts. Empty means none.
 	Command string
 	// Rows and Cols are the initial PTY size.
@@ -65,7 +68,11 @@ func Create(opts CreateOptions) (Meta, error) {
 			return Meta{}, fmt.Errorf("session name %q is already in use", name)
 		}
 	} else {
-		name = UniqueName(AutoName(opts.Command), names)
+		base := opts.DefaultName
+		if base == "" {
+			base = AutoName(opts.Command)
+		}
+		name = UniqueName(base, names)
 	}
 
 	id := LowestFree(used)

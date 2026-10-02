@@ -6,7 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -135,6 +135,45 @@ func Kill(id int) error {
 	return protocol.WriteFrame(conn, protocol.MsgKill, nil)
 }
 
+// Rename gives session id a new name, if no other live session has it. The
+// server owns session.json, so the change goes through its socket.
+func Rename(id int, name string) error {
+	if err := ValidateName(name); err != nil {
+		return err
+	}
+	unlock, err := Lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	live, _, err := scanLocked()
+	if err != nil {
+		return err
+	}
+	for _, s := range live {
+		if s.ID != id && s.Name == name {
+			return fmt.Errorf("session name %q is already in use", name)
+		}
+	}
+	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
+	if err != nil {
+		return ErrStale
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * probeTimeout))
+	if err := protocol.WriteFrame(conn, protocol.MsgRename, []byte(name)); err != nil {
+		return err
+	}
+	typ, reply, err := protocol.ReadFrame(conn)
+	if err != nil || typ != protocol.MsgRename {
+		return ErrUnresponsive
+	}
+	if len(reply) > 0 {
+		return errors.New(string(reply))
+	}
+	return nil
+}
+
 // scanLocked lists live sessions and removes the directories of dead ones.
 // It also returns every session ID still present on disk, live or not, so
 // allocation never collides with an existing directory. The caller must hold
@@ -193,8 +232,8 @@ func scanLocked() (live []Meta, used []int, err error) {
 			used = append(used, id)
 		}
 	}
-	sort.Slice(live, func(i, j int) bool { return live[i].ID < live[j].ID })
-	sort.Ints(used)
+	slices.SortFunc(live, func(a, b Meta) int { return a.ID - b.ID })
+	slices.Sort(used)
 	return live, used, nil
 }
 

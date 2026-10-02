@@ -25,7 +25,8 @@ const (
 	MsgPing
 	MsgPong
 	MsgRole
-	MsgKill // ask the server to terminate the session; no reply
+	MsgKill   // ask the server to terminate the session; no reply
+	MsgRename // payload: new name; the reply is empty on success, else an error message
 )
 
 // Roles of an attached client, carried in the first byte of the server's
@@ -38,7 +39,7 @@ const (
 
 // MaxPayload bounds the size of a single frame so a corrupt or hostile peer
 // cannot make us allocate arbitrary amounts of memory.
-const MaxPayload = 16 << 20
+const MaxPayload = 1 << 20
 
 const headerSize = 5
 
@@ -70,7 +71,7 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 	}
 	payload := make([]byte, n)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 		}
 		return 0, nil, err
@@ -81,12 +82,12 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 // Hello is the payload of the client's MsgHello: its terminal size, and
 // whether it only wants to watch.
 type Hello struct {
-	Rows, Cols uint16
-	ReadOnly   bool
+	Size     Resize
+	ReadOnly bool
 }
 
 func (h Hello) Encode() []byte {
-	b := Resize{Rows: h.Rows, Cols: h.Cols}.Encode()
+	b := h.Size.Encode()
 	if h.ReadOnly {
 		return append(b, 1)
 	}
@@ -94,33 +95,40 @@ func (h Hello) Encode() []byte {
 }
 
 func DecodeHello(p []byte) (Hello, error) {
-	if len(p) != 5 {
+	if len(p) != resizeSize+1 {
 		return Hello{}, fmt.Errorf("protocol: bad hello length %d", len(p))
 	}
-	r, _ := DecodeResize(p[:4])
-	return Hello{Rows: r.Rows, Cols: r.Cols, ReadOnly: p[4] != 0}, nil
+	r, _ := DecodeResize(p[:resizeSize])
+	return Hello{Size: r, ReadOnly: p[resizeSize] != 0}, nil
 }
 
-// Resize is the payload of MsgResize.
+// Resize is a terminal size, the payload of MsgResize. The pixel size is
+// passed along because programs that draw images read it from the PTY.
 type Resize struct {
-	Rows uint16
-	Cols uint16
+	Rows, Cols     uint16
+	XPixel, YPixel uint16
 }
+
+const resizeSize = 8
 
 func (r Resize) Encode() []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint16(b[0:2], r.Rows)
-	binary.BigEndian.PutUint16(b[2:4], r.Cols)
+	b := make([]byte, resizeSize)
+	binary.BigEndian.PutUint16(b[0:], r.Rows)
+	binary.BigEndian.PutUint16(b[2:], r.Cols)
+	binary.BigEndian.PutUint16(b[4:], r.XPixel)
+	binary.BigEndian.PutUint16(b[6:], r.YPixel)
 	return b
 }
 
 func DecodeResize(p []byte) (Resize, error) {
-	if len(p) != 4 {
+	if len(p) != resizeSize {
 		return Resize{}, fmt.Errorf("protocol: bad resize payload length %d", len(p))
 	}
 	return Resize{
-		Rows: binary.BigEndian.Uint16(p[0:2]),
-		Cols: binary.BigEndian.Uint16(p[2:4]),
+		Rows:   binary.BigEndian.Uint16(p[0:]),
+		Cols:   binary.BigEndian.Uint16(p[2:]),
+		XPixel: binary.BigEndian.Uint16(p[4:]),
+		YPixel: binary.BigEndian.Uint16(p[6:]),
 	}, nil
 }
 

@@ -1,5 +1,5 @@
 // Command moor runs interactive shells in persistent PTYs that can be
-// detached with Ctrl-\ twice and reattached later.
+// detached with Ctrl-\ twice (or Ctrl-b d) and reattached later.
 package main
 
 import (

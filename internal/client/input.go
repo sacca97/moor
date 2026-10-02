@@ -10,9 +10,11 @@ import (
 const (
 	esc        = 0x1b
 	detachByte = 0x1c // Ctrl-\
+	prefixByte = 0x02 // Ctrl-b
 )
 
-// detachTimeout is how long a Ctrl-\ is held back waiting for a second one.
+// detachTimeout is how long a Ctrl-\ or Ctrl-b is held back waiting for the
+// key that completes the detach sequence.
 // If it expires, the Ctrl-\ is forwarded to the session.
 const detachTimeout = 400 * time.Millisecond
 
@@ -21,17 +23,18 @@ var (
 	pasteEnd   = []byte("\x1b[201~")
 )
 
-// detachFilter watches keyboard input for Ctrl-\ Ctrl-\, the detach key.
+// detachFilter watches keyboard input for the detach keys: Ctrl-\ Ctrl-\, or
+// Ctrl-b d as in tmux.
 //
-// A Ctrl-\ press is held back rather than forwarded; a second one means
-// detach, any other key releases the held Ctrl-\ followed by that key, and a
-// timeout releases it alone. All other input, Esc included, passes through
-// without delay.
+// A Ctrl-\ or Ctrl-b press is held back rather than forwarded. Ctrl-\ then
+// Ctrl-\, or Ctrl-b then d, means detach; any other key releases the held
+// press followed by that key, and a timeout releases it alone. All other
+// input, Esc included, passes through without delay.
 //
-// Besides the raw 0x1c byte, Ctrl-\ is recognized in the encodings terminals
+// Besides the raw bytes, the keys are recognized in the encodings terminals
 // use when a program enables extended keyboard reporting: the kitty keyboard
-// protocol (CSI 92;5u, as Codex enables) and xterm's modifyOtherKeys
-// (CSI 27;5;92~). To find those, input is split into tokens: a complete
+// protocol (CSI 92;5u for Ctrl-\, as Codex enables) and xterm's
+// modifyOtherKeys (CSI 27;5;92~). To find those, input is split into tokens: a complete
 // escape sequence, an ESC plus one byte, or a single byte. Detection is
 // suspended inside bracketed pastes.
 //
@@ -39,15 +42,16 @@ var (
 // detachTimeout whenever a feed starts a new pending state (see epoch).
 type detachFilter struct {
 	seq     []byte // incomplete escape sequence
-	held    []byte // a held Ctrl-\ press (plus any key releases after it)
+	held    []byte // a held Ctrl-\ or Ctrl-b press (plus any key releases after it)
+	prefix  bool   // held is Ctrl-b, waiting for d, rather than Ctrl-\
 	inPaste bool
-	// epoch increments each time a Ctrl-\ starts being held, so a timer
+	// epoch increments each time a press starts being held, so a timer
 	// armed for an earlier press can be recognized as stale.
 	epoch int
 }
 
 // feed processes input and returns the bytes to forward. detach is true when
-// Ctrl-\ Ctrl-\ was seen; any input after it is discarded.
+// a detach sequence was seen; any input after it is discarded.
 func (f *detachFilter) feed(p []byte) (out []byte, detach bool) {
 	for _, b := range p {
 		if len(f.seq) == 0 {
@@ -110,23 +114,27 @@ func (f *detachFilter) emit(out, tok []byte) ([]byte, bool) {
 		}
 		return append(out, tok...), false
 	}
-	switch keyEvent(tok) {
-	case detachPress:
-		if len(f.held) > 0 {
+	ev := keyEvent(tok)
+	if len(f.held) > 0 {
+		switch {
+		case ev == detachPress && !f.prefix, ev == dKey && f.prefix:
 			f.reset()
 			return out, true
-		}
-		f.epoch++
-		f.held = append(f.held, tok...)
-		return out, false
-	case detachRelease:
-		if len(f.held) > 0 {
+		case ev == keyRelease:
 			f.held = append(f.held, tok...)
 			return out, false
 		}
+		// Not the second half of a detach: release what was held, then
+		// treat tok afresh (it may itself start a new press).
+		out = append(out, f.held...)
+		f.reset()
 	}
-	out = append(out, f.held...)
-	f.held = f.held[:0]
+	if ev == detachPress || ev == prefixPress {
+		f.epoch++
+		f.prefix = ev == prefixPress
+		f.held = append(f.held, tok...)
+		return out, false
+	}
 	out = append(out, tok...)
 	if bytes.Equal(tok, pasteStart) {
 		f.inPaste = true
@@ -147,44 +155,73 @@ func (f *detachFilter) flush() []byte {
 func (f *detachFilter) reset() {
 	f.seq = f.seq[:0]
 	f.held = f.held[:0]
+	f.prefix = false
 }
 
 const (
-	otherKey = iota
-	detachPress
-	detachRelease
+	otherKey    = iota
+	detachPress // Ctrl-\
+	prefixPress // Ctrl-b
+	dKey        // d, with no modifiers
+	keyRelease  // release of a Ctrl-\ or Ctrl-b (kitty protocol only)
 )
 
-// keyEvent classifies a token as a Ctrl-\ press, a Ctrl-\ release (kitty
-// protocol only), or anything else.
+// keyEvent classifies a token as one of the keys the filter cares about, in
+// any of the encodings it recognizes, or anything else.
 func keyEvent(tok []byte) int {
-	if len(tok) == 1 && tok[0] == detachByte {
-		return detachPress
+	if len(tok) == 1 {
+		switch tok[0] {
+		case detachByte:
+			return detachPress
+		case prefixByte:
+			return prefixPress
+		case 'd':
+			return dKey
+		}
+		return otherKey
 	}
-	if string(tok) == "\x1b[27;5;92~" { // xterm modifyOtherKeys
+	switch string(tok) { // xterm modifyOtherKeys
+	case "\x1b[27;5;92~":
 		return detachPress
+	case "\x1b[27;5;98~":
+		return prefixPress
 	}
-	// kitty: CSI key[:alternates] ; modifiers[:event] [; text] u
+	// kitty: CSI key[:alternates] [; modifiers[:event] [; text]] u
 	if len(tok) < 4 || tok[0] != esc || tok[1] != '[' || tok[len(tok)-1] != 'u' {
 		return otherKey
 	}
 	fields := strings.Split(string(tok[2:len(tok)-1]), ";")
-	if len(fields) < 2 {
+	key, _, _ := strings.Cut(fields[0], ":")
+	mods, event := "1", ""
+	if len(fields) > 1 {
+		mods, event, _ = strings.Cut(fields[1], ":")
+	}
+	m, err := strconv.Atoi(mods)
+	if err != nil {
 		return otherKey
 	}
-	key, _, _ := strings.Cut(fields[0], ":")
-	mods, event, _ := strings.Cut(fields[1], ":")
-	m, err := strconv.Atoi(mods)
 	// Modifiers are encoded as 1 + bits; ignore Caps Lock (64) and Num Lock
-	// (128), require exactly Ctrl (4).
-	if key != "92" || err != nil || (m-1)&^(64|128) != 4 {
+	// (128).
+	ctrl := (m-1)&^(64|128) == 4
+	plain := (m-1)&^(64|128) == 0
+	var ev int
+	switch {
+	case key == "92" && ctrl:
+		ev = detachPress
+	case key == "98" && ctrl:
+		ev = prefixPress
+	case key == "100" && plain:
+		ev = dKey
+	default:
 		return otherKey
 	}
 	switch event {
 	case "", "1", "2":
-		return detachPress
+		return ev
 	case "3":
-		return detachRelease
+		if ev != dKey {
+			return keyRelease
+		}
 	}
 	return otherKey
 }

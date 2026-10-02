@@ -42,10 +42,9 @@ const (
 // read-only, may type into it and set its size.
 type client struct {
 	conn     net.Conn
-	readOnly bool        // asked to only watch; never becomes the writer
-	writer   atomic.Bool // announced role; changed under server.mu
-	rows     uint16      // last known terminal size; guarded by server.mu
-	cols     uint16
+	readOnly bool            // asked to only watch; never becomes the writer
+	writer   atomic.Bool     // announced role; changed under server.mu
+	size     protocol.Resize // last known terminal size; guarded by server.mu
 
 	// While replaying, the client is still being sent the scrollback by its
 	// attach goroutine, outside server.mu. Frames for it are queued in
@@ -97,7 +96,11 @@ func Serve(id int, rows, cols uint16) int {
 	syscall.CloseOnExec(readyFD)
 	ready := os.NewFile(readyFD, "ready")
 
-	signal.Ignore(syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGPIPE)
+	// Catch these rather than ignore them: an ignored signal stays ignored
+	// in the shell and every program it starts, which would make Ctrl-C and
+	// hangups do nothing inside the session. Handled signals are reset to
+	// their defaults on exec. The channel is never read; sends do not block.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGPIPE)
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGTERM)
 
@@ -195,10 +198,11 @@ func (s *server) run(term <-chan os.Signal) int {
 	s.ln.Close()
 	s.mu.Lock()
 	for _, c := range s.clients {
-		if !c.replaying { // otherwise its attach goroutine is writing
-			c.conn.SetWriteDeadline(time.Now().Add(time.Second))
-			protocol.WriteFrame(c.conn, protocol.MsgExit, protocol.EncodeExit(code))
-		}
+		// A whole frame is written atomically, so this is safe even while the
+		// attach goroutine is still sending a replay; the client treats an
+		// exit between replay chunks as the end of the session.
+		c.conn.SetWriteDeadline(time.Now().Add(time.Second))
+		protocol.WriteFrame(c.conn, protocol.MsgExit, protocol.EncodeExit(code))
 		c.conn.Close()
 	}
 	s.clients = nil
@@ -213,13 +217,24 @@ func (s *server) run(term <-chan os.Signal) int {
 // gets SIGHUP explicitly. SIGKILL follows if the shell refuses to go.
 func (s *server) hangup(waited <-chan struct{}) {
 	pid := s.cmd.Process.Pid
+	// The foreground job has its own process group. Closing the master
+	// hangs it up too, but a shell that does not pass SIGHUP on (bash
+	// started as sh) would otherwise leave it running, so signal it
+	// explicitly.
+	fg := foregroundPgrp(s.ptmx)
 	syscall.Kill(-pid, syscall.SIGHUP)
 	syscall.Kill(pid, syscall.SIGHUP)
+	if fg > 0 && fg != pid {
+		syscall.Kill(-fg, syscall.SIGHUP)
+	}
 	s.ptmx.Close()
 	select {
 	case <-waited:
 	case <-time.After(2 * time.Second):
 		syscall.Kill(-pid, syscall.SIGKILL)
+		if fg > 0 && fg != pid {
+			syscall.Kill(-fg, syscall.SIGKILL)
+		}
 		<-waited
 	}
 }
@@ -302,6 +317,8 @@ func (s *server) handle(conn net.Conn) {
 		conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
 		protocol.WriteFrame(conn, protocol.MsgPong, []byte{byte(min(s.nclients.Load(), 255))})
 		conn.Close()
+	case protocol.MsgRename:
+		s.rename(conn, string(payload))
 	case protocol.MsgKill:
 		select {
 		case s.stop <- struct{}{}:
@@ -315,13 +332,32 @@ func (s *server) handle(conn net.Conn) {
 	}
 }
 
+// rename changes the session's name in session.json and answers conn. The
+// running shell keeps the name it was started with in its prompt.
+func (s *server) rename(conn net.Conn, name string) {
+	defer conn.Close()
+	err := session.ValidateName(name)
+	if err == nil {
+		s.metaMu.Lock()
+		s.meta.Name = name
+		err = session.WriteMeta(s.dir, s.meta)
+		s.metaMu.Unlock()
+	}
+	var reply []byte
+	if err != nil {
+		reply = []byte(err.Error())
+	}
+	conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+	protocol.WriteFrame(conn, protocol.MsgRename, reply)
+}
+
 func (s *server) attach(conn net.Conn, hello []byte) {
 	defer conn.Close()
 	h, err := protocol.DecodeHello(hello)
 	if err != nil {
 		return
 	}
-	c := &client{conn: conn, readOnly: h.ReadOnly, rows: h.Rows, cols: h.Cols}
+	c := &client{conn: conn, readOnly: h.ReadOnly, size: h.Size}
 	role := protocol.RoleWriter
 	if c.readOnly {
 		role = protocol.RoleReadOnly
@@ -372,9 +408,9 @@ loop:
 		case protocol.MsgResize:
 			if r, err := protocol.DecodeResize(payload); err == nil {
 				s.mu.Lock()
-				c.rows, c.cols = r.Rows, r.Cols
+				c.size = r
 				if c.writer.Load() {
-					setSize(s.ptmx, r.Rows, r.Cols, false)
+					setSize(s.ptmx, r, false)
 				}
 				s.mu.Unlock()
 			}
@@ -473,7 +509,7 @@ func (s *server) rolesLocked() {
 		}
 	}
 	if w != nil && w != s.lastWriter {
-		setSize(s.ptmx, w.rows, w.cols, true)
+		setSize(s.ptmx, w.size, true)
 	}
 	s.lastWriter = w
 }

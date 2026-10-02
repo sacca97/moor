@@ -1,7 +1,7 @@
 # moor
 
-Keep a shell running after you close the terminal. Detach with Ctrl-\ twice,
-attach again later from any terminal.
+Keep a shell running after you close the terminal. Detach with Ctrl-\ twice or
+Ctrl-b d, attach again later from any terminal.
 
 ## Install
 
