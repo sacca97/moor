@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,12 +16,6 @@ import (
 
 	"github.com/sacca/moor/internal/protocol"
 )
-
-// Info describes a live session.
-type Info struct {
-	Meta
-	Attached bool
-}
 
 const probeTimeout = time.Second
 
@@ -36,8 +31,12 @@ var (
 // $XDG_RUNTIME_DIR/moor, or /tmp/moor-$UID as a fallback.
 func Root() string {
 	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" && filepath.IsAbs(xdg) {
-		if fi, err := os.Stat(xdg); err == nil && fi.IsDir() {
-			return filepath.Join(xdg, "moor")
+		// Only trust it if it is ours and not writable by others, as the
+		// XDG specification requires.
+		if fi, err := os.Stat(xdg); err == nil && fi.IsDir() && fi.Mode().Perm()&0o022 == 0 {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Getuid() {
+				return filepath.Join(xdg, "moor")
+			}
 		}
 	}
 	return filepath.Join(os.TempDir(), fmt.Sprintf("moor-%d", os.Getuid()))
@@ -95,39 +94,52 @@ func Lock() (func(), error) {
 	}, nil
 }
 
-// Probe asks the session server whether it is alive and whether a client is
+// Probe asks the session server whether it is alive and how many clients are
 // attached.
-func Probe(id int) (attached bool, err error) {
+func Probe(id int) (clients int, err error) {
 	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
 	if err != nil {
-		return false, ErrStale
+		return 0, ErrStale
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(probeTimeout))
 	if err := protocol.WriteFrame(conn, protocol.MsgPing, nil); err != nil {
-		return false, ErrUnresponsive
+		return 0, ErrUnresponsive
 	}
 	typ, payload, err := protocol.ReadFrame(conn)
 	if err != nil {
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
-			return false, ErrUnresponsive
+			return 0, ErrUnresponsive
 		}
 		// The server closed the connection without answering: it is
 		// shutting down.
-		return false, ErrStale
+		return 0, ErrStale
 	}
 	if typ != protocol.MsgPong || len(payload) != 1 {
-		return false, ErrUnresponsive
+		return 0, ErrUnresponsive
 	}
-	return payload[0] == 1, nil
+	return int(payload[0]), nil
+}
+
+// Kill asks the server of session id to terminate its shell and exit. It
+// goes through the session's own socket rather than a signal to a pid, so it
+// can only ever reach that session's server.
+func Kill(id int) error {
+	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
+	if err != nil {
+		return ErrStale
+	}
+	defer conn.Close()
+	conn.SetWriteDeadline(time.Now().Add(probeTimeout))
+	return protocol.WriteFrame(conn, protocol.MsgKill, nil)
 }
 
 // scanLocked lists live sessions and removes the directories of dead ones.
 // It also returns every session ID still present on disk, live or not, so
 // allocation never collides with an existing directory. The caller must hold
 // the lock.
-func scanLocked() (live []Info, used []int, err error) {
+func scanLocked() (live []Meta, used []int, err error) {
 	root, err := EnsureRoot()
 	if err != nil {
 		return nil, nil, err
@@ -136,12 +148,34 @@ func scanLocked() (live []Info, used []int, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	var ids []int
 	for _, e := range entries {
 		id, err := strconv.Atoi(e.Name())
 		if err != nil || id < 0 || strconv.Itoa(id) != e.Name() || !e.IsDir() {
 			continue
 		}
-		attached, perr := Probe(id)
+		ids = append(ids, id)
+	}
+
+	// Probe every session at once, so servers that do not answer cost one
+	// timeout in total rather than one each.
+	type probe struct {
+		clients int
+		err     error
+	}
+	probes := make([]probe, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			probes[i].clients, probes[i].err = Probe(id)
+		}()
+	}
+	wg.Wait()
+
+	for i, id := range ids {
+		clients, perr := probes[i].clients, probes[i].err
 		switch {
 		case perr == nil:
 			m, err := ReadMeta(Dir(id))
@@ -150,7 +184,8 @@ func scanLocked() (live []Info, used []int, err error) {
 				m = Meta{ID: id, Name: "?"}
 			}
 			m.ID = id
-			live = append(live, Info{Meta: m, Attached: attached})
+			m.Clients = clients
+			live = append(live, m)
 			used = append(used, id)
 		case errors.Is(perr, ErrStale):
 			os.RemoveAll(Dir(id))
@@ -164,7 +199,7 @@ func scanLocked() (live []Info, used []int, err error) {
 }
 
 // List returns all live sessions sorted by ID, cleaning up stale ones.
-func List() ([]Info, error) {
+func List() ([]Meta, error) {
 	unlock, err := Lock()
 	if err != nil {
 		return nil, err
@@ -175,10 +210,10 @@ func List() ([]Info, error) {
 }
 
 // Resolve finds a live session by exact numeric ID, then by exact name.
-func Resolve(target string) (Info, error) {
+func Resolve(target string) (Meta, error) {
 	sessions, err := List()
 	if err != nil {
-		return Info{}, err
+		return Meta{}, err
 	}
 	if id, err := strconv.Atoi(target); err == nil {
 		for _, s := range sessions {
@@ -192,7 +227,7 @@ func Resolve(target string) (Info, error) {
 			return s, nil
 		}
 	}
-	return Info{}, fmt.Errorf("no session %q", target)
+	return Meta{}, fmt.Errorf("no session %q", target)
 }
 
 // Remove deletes the runtime directory of session id, but only if it still

@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -26,12 +25,19 @@ Usage:
   moor [-n NAME]                 start a shell and attach to it
   moor [-n NAME] start COMMAND   start a shell, run COMMAND in it, attach
   moor [-n NAME] run COMMAND     same as start, but stay detached
-  moor attach ID|NAME            attach to a session (also: moor -a ID|NAME)
+  moor attach [-r] ID|NAME       attach to a session (also: moor -a ID|NAME)
   moor ps                        list sessions
   moor kill ID|NAME              terminate a session
+  moor --version                 print the version
 
 Press Ctrl-\ twice to detach. The shell keeps running.
+
+A session can have several terminals attached. The newest one controls it; the
+others are read-only until it detaches. With -r, a terminal only watches.
 `
+
+// Version is the moor version, set by the main package.
+var Version = "dev"
 
 type usageError string
 
@@ -58,7 +64,7 @@ func Main(args []string) int {
 
 func run(args []string) error {
 	var name, attach string
-	var nameSet, attachSet bool
+	var nameSet, attachSet, readOnly bool
 
 	i := 0
 	for ; i < len(args); i++ {
@@ -66,6 +72,9 @@ func run(args []string) error {
 		switch {
 		case a == "-h" || a == "--help":
 			fmt.Print(usage)
+			return nil
+		case a == "--version":
+			fmt.Println("moor", Version)
 			return nil
 		case a == "-n" || a == "--name":
 			if i+1 >= len(args) {
@@ -83,6 +92,8 @@ func run(args []string) error {
 			attach, attachSet = args[i], true
 		case strings.HasPrefix(a, "--attach="):
 			attach, attachSet = strings.TrimPrefix(a, "--attach="), true
+		case a == "-r" || a == "--read-only":
+			readOnly = true
 		case a == "--":
 			i++
 			goto parsed
@@ -102,9 +113,12 @@ parsed:
 	}
 	if attachSet {
 		if nameSet || len(rest) > 0 {
-			return usageError("-a takes no other arguments")
+			return usageError("-a takes no other arguments except -r")
 		}
-		return cmdAttach(attach)
+		return cmdAttach(attach, readOnly)
+	}
+	if readOnly && (len(rest) == 0 || (rest[0] != "attach" && rest[0] != "a")) {
+		return usageError("-r only applies to attach")
 	}
 	if len(rest) == 0 {
 		return cmdNew(name, "", true)
@@ -115,10 +129,14 @@ parsed:
 		command := joinCommand(rest[1:])
 		return cmdNew(name, command, rest[0] == "start")
 	case "attach", "a":
-		if nameSet || len(rest) != 2 {
-			return usageError("usage: moor attach ID|NAME")
+		targets := rest[1:]
+		if len(targets) > 0 && (targets[0] == "-r" || targets[0] == "--read-only") {
+			readOnly, targets = true, targets[1:]
 		}
-		return cmdAttach(rest[1])
+		if nameSet || len(targets) != 1 {
+			return usageError("usage: moor attach [-r] ID|NAME")
+		}
+		return cmdAttach(targets[0], readOnly)
 	case "ps", "ls", "list":
 		if nameSet || len(rest) != 1 {
 			return usageError("usage: moor ps")
@@ -129,6 +147,9 @@ parsed:
 			return usageError("usage: moor kill ID|NAME")
 		}
 		return cmdKill(rest[1])
+	case "version":
+		fmt.Println("moor", Version)
+		return nil
 	case "help":
 		fmt.Print(usage)
 		return nil
@@ -155,28 +176,22 @@ func cmdNew(name, command string, attach bool) error {
 		fmt.Printf("started %s\n", sessionLabel(m.ID, m.Name))
 		return nil
 	}
-	return attachTo(m.ID, m.Name)
+	return attachTo(m.ID, m.Name, false)
 }
 
-func cmdAttach(target string) error {
+func cmdAttach(target string, readOnly bool) error {
 	s, err := session.Resolve(target)
 	if err != nil {
 		return err
 	}
-	if s.Attached {
-		return fmt.Errorf("session %d is already attached", s.ID)
-	}
-	return attachTo(s.ID, s.Name)
+	return attachTo(s.ID, s.Name, readOnly)
 }
 
-func attachTo(id int, name string) error {
+func attachTo(id int, name string, readOnly bool) error {
 	if os.Getenv("MOOR_SESSION") == strconv.Itoa(id) {
 		return fmt.Errorf("cannot attach session %d from inside itself", id)
 	}
-	o, err := client.Attach(session.SocketPath(id))
-	if errors.Is(err, client.ErrBusy) {
-		return fmt.Errorf("session %d is already attached", id)
-	}
+	o, err := client.Attach(session.SocketPath(id), readOnly)
 	if err != nil {
 		return err
 	}
@@ -210,8 +225,11 @@ func cmdPs(w io.Writer) error {
 	fmt.Fprintln(tw, "ID\tNAME\tSTATUS\tPID")
 	for _, s := range sessions {
 		status := "detached"
-		if s.Attached {
+		switch {
+		case s.Clients == 1:
 			status = "attached"
+		case s.Clients > 1:
+			status = fmt.Sprintf("attached (%d)", s.Clients)
 		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%d\n", s.ID, s.Name, status, s.PID)
 	}
@@ -223,10 +241,7 @@ func cmdKill(target string) error {
 	if err != nil {
 		return err
 	}
-	if s.PID <= 0 {
-		return fmt.Errorf("session %d has no known server pid", s.ID)
-	}
-	if err := syscall.Kill(s.PID, syscall.SIGTERM); err != nil {
+	if err := session.Kill(s.ID); err != nil {
 		return fmt.Errorf("killing session %d: %w", s.ID, err)
 	}
 	deadline := time.Now().Add(5 * time.Second)

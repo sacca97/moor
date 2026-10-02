@@ -10,12 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/sacca/moor/internal/protocol"
 	"github.com/sacca/moor/internal/session"
@@ -25,7 +24,11 @@ const (
 	scrollbackSize = 8 << 20
 	// writeTimeout bounds how long PTY output may block on a stuck client
 	// before the client is dropped; the shell must never stall on it.
-	writeTimeout     = 10 * time.Second
+	writeTimeout = 10 * time.Second
+	// watcherTimeout is the same for clients that are not the writer: a
+	// frozen watcher (a suspended terminal, say) is dropped quickly rather
+	// than holding up the session and the writer's output.
+	watcherTimeout   = time.Second
 	handshakeTimeout = 5 * time.Second
 	replayChunk      = 64 << 10
 	// drainTimeout is how long to wait for remaining PTY output after the
@@ -34,6 +37,33 @@ const (
 	readyFD      = 3
 )
 
+// client is one attached terminal. Every client sees the session's output,
+// but only the writer, the most recent client that did not ask to be
+// read-only, may type into it and set its size.
+type client struct {
+	conn     net.Conn
+	readOnly bool        // asked to only watch; never becomes the writer
+	writer   atomic.Bool // announced role; changed under server.mu
+	rows     uint16      // last known terminal size; guarded by server.mu
+	cols     uint16
+
+	// While replaying, the client is still being sent the scrollback by its
+	// attach goroutine, outside server.mu. Frames for it are queued in
+	// backlog meanwhile and sent when the replay is done. Guarded by server.mu.
+	replaying    bool
+	backlog      []frame
+	backlogBytes int
+}
+
+type frame struct {
+	typ     byte
+	payload []byte
+}
+
+// maxBacklog bounds what is queued for a client that is slow to take its
+// replay; beyond it the client is dropped.
+const maxBacklog = scrollbackSize
+
 type server struct {
 	id   int
 	dir  string
@@ -41,11 +71,15 @@ type server struct {
 	ptmx *os.File
 	cmd  *exec.Cmd
 
-	// mu guards client, scroll, and every write to client.
-	mu       sync.Mutex
-	client   net.Conn
-	scroll   *Ring
-	attached atomic.Bool
+	// mu guards clients, lastWriter, scroll, and writes to clients (except a
+	// replaying client's replay, which is sent without it).
+	mu         sync.Mutex
+	clients    []*client // in attach order; the newest non-read-only one writes
+	lastWriter *client
+	scroll     *Ring
+	nclients   atomic.Int32
+
+	stop chan struct{} // receives when "moor kill" asks the session to end
 
 	metaMu sync.Mutex
 	meta   session.Meta
@@ -83,6 +117,7 @@ func start(id int, rows, cols uint16) (*server, error) {
 		id:          id,
 		dir:         session.Dir(id),
 		scroll:      NewRing(scrollbackSize),
+		stop:        make(chan struct{}, 1),
 		firstOutput: make(chan struct{}),
 		readerDone:  make(chan struct{}),
 	}
@@ -149,6 +184,8 @@ func (s *server) run(term <-chan os.Signal) int {
 		}
 	case <-term:
 		s.hangup(waited)
+	case <-s.stop:
+		s.hangup(waited)
 	}
 
 	code := -1
@@ -157,12 +194,14 @@ func (s *server) run(term <-chan os.Signal) int {
 	}
 	s.ln.Close()
 	s.mu.Lock()
-	if s.client != nil {
-		s.client.SetWriteDeadline(time.Now().Add(time.Second))
-		protocol.WriteFrame(s.client, protocol.MsgExit, protocol.EncodeExit(code))
-		s.client.Close()
-		s.client = nil
+	for _, c := range s.clients {
+		if !c.replaying { // otherwise its attach goroutine is writing
+			c.conn.SetWriteDeadline(time.Now().Add(time.Second))
+			protocol.WriteFrame(c.conn, protocol.MsgExit, protocol.EncodeExit(code))
+		}
+		c.conn.Close()
 	}
+	s.clients = nil
 	s.mu.Unlock()
 	session.Remove(s.id, os.Getpid())
 	s.ptmx.Close()
@@ -198,11 +237,14 @@ func (s *server) readLoop() {
 			once.Do(func() { close(s.firstOutput) })
 			s.mu.Lock()
 			s.scroll.Write(buf[:n])
-			if s.client != nil {
-				s.client.SetWriteDeadline(time.Now().Add(writeTimeout))
-				if err := protocol.WriteFrame(s.client, protocol.MsgOutput, buf[:n]); err != nil {
-					s.dropClientLocked()
+			var failed []*client
+			for _, c := range s.clients {
+				if err := s.sendLocked(c, protocol.MsgOutput, buf[:n]); err != nil {
+					failed = append(failed, c)
 				}
+			}
+			for _, c := range failed {
+				s.dropLocked(c)
 			}
 			s.mu.Unlock()
 		}
@@ -257,12 +299,14 @@ func (s *server) handle(conn net.Conn) {
 	conn.SetReadDeadline(time.Time{})
 	switch typ {
 	case protocol.MsgPing:
-		var b byte
-		if s.attached.Load() {
-			b = 1
-		}
 		conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
-		protocol.WriteFrame(conn, protocol.MsgPong, []byte{b})
+		protocol.WriteFrame(conn, protocol.MsgPong, []byte{byte(min(s.nclients.Load(), 255))})
+		conn.Close()
+	case protocol.MsgKill:
+		select {
+		case s.stop <- struct{}{}:
+		default:
+		}
 		conn.Close()
 	case protocol.MsgHello:
 		s.attach(conn, payload)
@@ -273,40 +317,46 @@ func (s *server) handle(conn net.Conn) {
 
 func (s *server) attach(conn net.Conn, hello []byte) {
 	defer conn.Close()
-	size, err := protocol.DecodeResize(hello)
+	h, err := protocol.DecodeHello(hello)
 	if err != nil {
 		return
 	}
-
-	s.mu.Lock()
-	if s.client != nil {
-		conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
-		protocol.WriteFrame(conn, protocol.MsgHello,
-			protocol.HelloReply{Status: protocol.HelloBusy}.Encode())
-		s.mu.Unlock()
-		return
+	c := &client{conn: conn, readOnly: h.ReadOnly, rows: h.Rows, cols: h.Cols}
+	role := protocol.RoleWriter
+	if c.readOnly {
+		role = protocol.RoleReadOnly
 	}
-	// Replay under the lock so no live output can slip in between the
-	// buffered output and the live stream.
+	c.writer.Store(!c.readOnly)
+
+	// Register the client first, then stream the scrollback without holding
+	// the lock: a slow terminal must not stall the session or its writer.
+	// Live output for the client is queued until the replay is through.
+	s.mu.Lock()
 	replay := s.replayLocked()
+	c.replaying = true
+	s.clients = append(s.clients, c)
+	s.nclients.Store(int32(len(s.clients)))
+	s.rolesLocked()
+	s.mu.Unlock()
+	s.syncMeta()
+
 	conn.SetWriteDeadline(time.Now().Add(writeTimeout + time.Duration(len(replay)>>20)*time.Second))
 	err = protocol.WriteFrame(conn, protocol.MsgHello,
-		protocol.HelloReply{Status: protocol.HelloOK, ReplayLen: uint32(len(replay))}.Encode())
+		protocol.HelloReply{Role: role, ReplayLen: uint32(len(replay))}.Encode())
 	for len(replay) > 0 && err == nil {
 		n := min(len(replay), replayChunk)
 		err = protocol.WriteFrame(conn, protocol.MsgOutput, replay[:n])
 		replay = replay[n:]
 	}
+	if err == nil {
+		err = s.finishReplay(c)
+	}
 	if err != nil {
+		s.mu.Lock()
+		s.dropLocked(c)
 		s.mu.Unlock()
 		return
 	}
-	s.client = conn
-	s.attached.Store(true)
-	s.mu.Unlock()
-	s.syncMeta()
-
-	setSize(s.ptmx, size.Rows, size.Cols, true)
 
 loop:
 	for {
@@ -316,15 +366,22 @@ loop:
 		}
 		switch typ {
 		case protocol.MsgInput:
-			s.ptmx.Write(payload)
+			if c.writer.Load() {
+				s.ptmx.Write(payload)
+			}
 		case protocol.MsgResize:
 			if r, err := protocol.DecodeResize(payload); err == nil {
-				setSize(s.ptmx, r.Rows, r.Cols, false)
+				s.mu.Lock()
+				c.rows, c.cols = r.Rows, r.Cols
+				if c.writer.Load() {
+					setSize(s.ptmx, r.Rows, r.Cols, false)
+				}
+				s.mu.Unlock()
 			}
 		case protocol.MsgPing:
 			s.mu.Lock()
-			if s.client == conn {
-				protocol.WriteFrame(conn, protocol.MsgPong, []byte{1})
+			if err := s.sendLocked(c, protocol.MsgPong, []byte{byte(min(len(s.clients), 255))}); err != nil {
+				s.dropLocked(c)
 			}
 			s.mu.Unlock()
 		case protocol.MsgDetach:
@@ -332,12 +389,107 @@ loop:
 		}
 	}
 	s.mu.Lock()
-	if s.client == conn {
-		s.client = nil
-		s.attached.Store(false)
-	}
+	s.dropLocked(c)
 	s.mu.Unlock()
-	s.syncMeta()
+}
+
+// timeoutFor is how long a write to c may block before it is dropped.
+func (s *server) timeoutFor(c *client) time.Duration {
+	if c.writer.Load() {
+		return writeTimeout
+	}
+	return watcherTimeout
+}
+
+// sendLocked writes a frame to c, or queues it if c is still taking its
+// replay. A non-nil error means c should be dropped.
+func (s *server) sendLocked(c *client, typ byte, payload []byte) error {
+	if c.replaying {
+		if c.backlogBytes+len(payload) > maxBacklog {
+			return errors.New("client too slow to take its replay")
+		}
+		c.backlog = append(c.backlog, frame{typ, bytes.Clone(payload)})
+		c.backlogBytes += len(payload)
+		return nil
+	}
+	c.conn.SetWriteDeadline(time.Now().Add(s.timeoutFor(c)))
+	return protocol.WriteFrame(c.conn, typ, payload)
+}
+
+// finishReplay sends what was queued for c during its replay, then switches
+// it to live delivery.
+func (s *server) finishReplay(c *client) error {
+	for {
+		s.mu.Lock()
+		if !slices.Contains(s.clients, c) {
+			s.mu.Unlock()
+			return errors.New("client was dropped")
+		}
+		queued := c.backlog
+		if len(queued) == 0 {
+			c.replaying = false
+			s.mu.Unlock()
+			return nil
+		}
+		c.backlog, c.backlogBytes = nil, 0
+		s.mu.Unlock()
+
+		c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		for _, f := range queued {
+			if err := protocol.WriteFrame(c.conn, f.typ, f.payload); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// writerLocked returns the client that currently controls the session: the
+// newest one that is not read-only, or nil.
+func (s *server) writerLocked() *client {
+	for i := len(s.clients) - 1; i >= 0; i-- {
+		if !s.clients[i].readOnly {
+			return s.clients[i]
+		}
+	}
+	return nil
+}
+
+// rolesLocked tells every client whose role changed about it, and gives the
+// PTY the new writer's size, forcing a SIGWINCH so full-screen programs
+// redraw for it.
+func (s *server) rolesLocked() {
+	w := s.writerLocked()
+	for _, c := range s.clients {
+		if is := c == w; is != c.writer.Load() {
+			c.writer.Store(is)
+			role := protocol.RoleReadOnly
+			if is {
+				role = protocol.RoleWriter
+			}
+			if err := s.sendLocked(c, protocol.MsgRole, []byte{role}); err != nil {
+				// Its attach goroutine sees the failed read and drops it.
+				c.conn.Close()
+			}
+		}
+	}
+	if w != nil && w != s.lastWriter {
+		setSize(s.ptmx, w.rows, w.cols, true)
+	}
+	s.lastWriter = w
+}
+
+// dropLocked closes and forgets a client, if it is still attached, and hands
+// control to the next writer.
+func (s *server) dropLocked(c *client) {
+	i := slices.Index(s.clients, c)
+	if i < 0 {
+		return
+	}
+	s.clients = slices.Delete(s.clients, i, i+1)
+	s.nclients.Store(int32(len(s.clients)))
+	c.conn.Close()
+	s.rolesLocked()
+	go s.syncMeta()
 }
 
 // replayLocked returns the scrollback to send to a newly attached client.
@@ -353,39 +505,14 @@ func (s *server) replayLocked() []byte {
 	return b
 }
 
-func (s *server) dropClientLocked() {
-	s.client.Close()
-	s.client = nil
-	s.attached.Store(false)
-	go s.syncMeta()
-}
-
-// syncMeta records the current attach state in session.json.
+// syncMeta records the current number of clients in session.json.
 func (s *server) syncMeta() {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
-	attached := s.attached.Load()
-	if s.meta.Attached == attached {
+	clients := int(s.nclients.Load())
+	if s.meta.Clients == clients {
 		return
 	}
-	s.meta.Attached = attached
+	s.meta.Clients = clients
 	session.WriteMeta(s.dir, s.meta)
-}
-
-// sameUser rejects connections from other users, in addition to the socket
-// and directory permissions.
-func sameUser(conn net.Conn) bool {
-	uc, ok := conn.(*net.UnixConn)
-	if !ok {
-		return false
-	}
-	raw, err := uc.SyscallConn()
-	if err != nil {
-		return false
-	}
-	var cred *unix.Ucred
-	raw.Control(func(fd uintptr) {
-		cred, err = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	})
-	return err == nil && cred != nil && int(cred.Uid) == os.Getuid()
 }

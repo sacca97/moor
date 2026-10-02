@@ -11,103 +11,64 @@ type step struct {
 	detach bool
 }
 
-func runSteps(t *testing.T, f *detachFilter, steps []step) {
-	t.Helper()
-	for i, s := range steps {
-		out, detach := f.feed([]byte(s.in))
-		if string(out) != s.out || detach != s.detach {
-			t.Fatalf("step %d: feed(%q) = (%q, %v), want (%q, %v)", i, s.in, out, detach, s.out, s.detach)
-		}
+const bs = "\x1c" // Ctrl-\
+
+// Detaching with real terminals and timing is covered end to end in
+// cmd/moor; these cases pin down the key-sequence state machine.
+func TestDetachFilter(t *testing.T) {
+	paste := "\x1b[200~a" + bs + bs + "b\x1b[201~"
+	cases := map[string][]step{
+		"plain input":        {{in: "hello\r", out: "hello\r"}},
+		"double press":       {{in: bs + bs, detach: true}},
+		"split double press": {{in: "ab", out: "ab"}, {in: bs}, {in: bs, detach: true}},
+		"input before it":    {{in: "ls\r" + bs + bs + "junk", out: "ls\r", detach: true}},
+		"escape is instant": {
+			{in: "\x1b", out: "\x1b"}, {in: "\x1b\x1b", out: "\x1b\x1b"}, {in: "\x1b[A", out: "\x1b[A"},
+			{in: "\x1bOB", out: "\x1bOB"}, {in: "\x1bx", out: "\x1bx"},
+			{in: "\x1b[27u\x1b[27u", out: "\x1b[27u\x1b[27u"}, // kitty Esc
+		},
+		"single press then key": {{in: bs}, {in: "x", out: bs + "x"}, {in: bs}, {in: "\x1b[A", out: bs + "\x1b[A"}},
+		"split kitty sequence":  {{in: "\x1b[92;5u"}, {in: "\x1b[92"}, {in: ";5u", detach: true}},
+		"kitty":                 {{in: "\x1b[92;5u"}, {in: "\x1b[92;5u", detach: true}},
+		"kitty with events":     {{in: "\x1b[92;5:1u"}, {in: "\x1b[92;5:3u"}, {in: "\x1b[92;5:1u", detach: true}},
+		"kitty with num lock":   {{in: "\x1b[92;133u"}, {in: "\x1b[92;133u", detach: true}},
+		"modifyOtherKeys":       {{in: "\x1b[27;5;92~"}, {in: bs, detach: true}},
+		"ctrl-shift is not it":  {{in: "\x1b[92;6u\x1b[92;6u", out: "\x1b[92;6u\x1b[92;6u"}, {in: "\x1b[92u\\", out: "\x1b[92u\\"}},
+		"lone release":          {{in: "\x1b[92;5:3u", out: "\x1b[92;5:3u"}},
+		"bracketed paste":       {{in: paste, out: paste}, {in: bs + bs, detach: true}},
+	}
+	for name, steps := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := &detachFilter{}
+			for i, s := range steps {
+				out, detach := f.feed([]byte(s.in))
+				if string(out) != s.out || detach != s.detach {
+					t.Fatalf("step %d: feed(%q) = (%q, %v), want (%q, %v)", i, s.in, out, detach, s.out, s.detach)
+				}
+			}
+		})
 	}
 }
 
-const ctrlBackslash = "\x1c"
-
-func TestDetachPlain(t *testing.T) {
-	runSteps(t, &detachFilter{}, []step{{in: "hello\r", out: "hello\r"}})
-}
-
-func TestDetachDoublePress(t *testing.T) {
-	runSteps(t, &detachFilter{}, []step{{in: ctrlBackslash + ctrlBackslash, detach: true}})
-	runSteps(t, &detachFilter{}, []step{{in: ctrlBackslash}, {in: ctrlBackslash, detach: true}})
-	runSteps(t, &detachFilter{}, []step{{in: "ab", out: "ab"}, {in: ctrlBackslash}, {in: ctrlBackslash, detach: true}})
-}
-
-func TestDetachForwardsInputBeforeIt(t *testing.T) {
-	runSteps(t, &detachFilter{}, []step{{in: "ls\r" + ctrlBackslash + ctrlBackslash + "junk", out: "ls\r", detach: true}})
-}
-
-func TestEscapePassesThroughImmediately(t *testing.T) {
+// A lone Ctrl-\ is held until the caller flushes it, and each new press starts
+// a new epoch so a stale timer cannot flush a newer one.
+func TestDetachHoldAndFlush(t *testing.T) {
 	f := &detachFilter{}
-	runSteps(t, f, []step{
-		{in: "\x1b", out: "\x1b"},
-		{in: "\x1b\x1b", out: "\x1b\x1b"},
-		{in: "\x1b[A", out: "\x1b[A"},
-		{in: "\x1bOB", out: "\x1bOB"},
-		{in: "\x1bx", out: "\x1bx"},
-		{in: "\x1b[27u\x1b[27u", out: "\x1b[27u\x1b[27u"}, // kitty Esc
-	})
+	f.feed([]byte("\x1b[A"))
 	if f.pending() {
 		t.Fatal("nothing should be held back")
 	}
-}
-
-func TestSingleCtrlBackslashIsReleased(t *testing.T) {
-	f := &detachFilter{}
-	runSteps(t, f, []step{{in: ctrlBackslash}})
-	if !f.pending() {
-		t.Fatal("Ctrl-\\ should be held")
-	}
-	if got := string(f.flush()); got != ctrlBackslash {
-		t.Fatalf("flush = %q", got)
-	}
-	// Followed by another key, both are forwarded in order.
-	runSteps(t, f, []step{{in: ctrlBackslash}, {in: "x", out: ctrlBackslash + "x"}})
-	runSteps(t, f, []step{{in: ctrlBackslash}, {in: "\x1b[A", out: ctrlBackslash + "\x1b[A"}})
-}
-
-func TestDetachHeldKeepsSplitSequence(t *testing.T) {
-	// While Ctrl-\\ is held, a sequence split across reads is completed
-	// before deciding, so a split kitty second press still detaches.
-	runSteps(t, &detachFilter{}, []step{{in: "\x1b[92;5u"}, {in: "\x1b[92"}, {in: ";5u", detach: true}})
-}
-
-func TestDetachKitty(t *testing.T) {
-	runSteps(t, &detachFilter{}, []step{{in: "\x1b[92;5u"}, {in: "\x1b[92;5u", detach: true}})
-	// With event types and release events reported.
-	runSteps(t, &detachFilter{}, []step{
-		{in: "\x1b[92;5:1u"}, {in: "\x1b[92;5:3u"}, {in: "\x1b[92;5:1u", detach: true},
-	})
-	// Num Lock on (modifiers 1+4+128).
-	runSteps(t, &detachFilter{}, []step{{in: "\x1b[92;133u"}, {in: "\x1b[92;133u", detach: true}})
-	// Mixed with the legacy byte and modifyOtherKeys.
-	runSteps(t, &detachFilter{}, []step{{in: "\x1b[27;5;92~"}, {in: ctrlBackslash, detach: true}})
-	// Ctrl-Shift-\\ and plain "\\" are other keys.
-	runSteps(t, &detachFilter{}, []step{
-		{in: "\x1b[92;6u\x1b[92;6u", out: "\x1b[92;6u\x1b[92;6u"},
-		{in: "\x1b[92u\\", out: "\x1b[92u\\"},
-	})
-	// A release with nothing held is forwarded.
-	runSteps(t, &detachFilter{}, []step{{in: "\x1b[92;5:3u", out: "\x1b[92;5:3u"}})
-}
-
-func TestDetachEpoch(t *testing.T) {
-	f := &detachFilter{}
-	f.feed([]byte(ctrlBackslash))
+	f.feed([]byte(bs))
 	e := f.epoch
+	if !f.pending() || string(f.flush()) != bs || f.pending() {
+		t.Fatal("a lone Ctrl-\\ should be held, then released by flush")
+	}
+	f.feed([]byte(bs))
 	f.feed([]byte("a"))
-	f.feed([]byte(ctrlBackslash))
-	if f.epoch == e || !f.pending() {
+	f.feed([]byte(bs))
+	if f.epoch != e+2 || !f.pending() {
 		t.Fatal("a new press must start a new epoch")
 	}
-}
-
-func TestDetachBracketedPaste(t *testing.T) {
-	paste := "\x1b[200~a" + ctrlBackslash + ctrlBackslash + "b\x1b[201~"
-	runSteps(t, &detachFilter{}, []step{
-		{in: paste, out: paste},
-		{in: ctrlBackslash + ctrlBackslash, detach: true},
-	})
 }
 
 func TestReplyDrain(t *testing.T) {
@@ -116,11 +77,11 @@ func TestReplyDrain(t *testing.T) {
 		t.Fatal("inactive drain must pass input through")
 	}
 	d.start()
-	if got := d.filter([]byte("\x1b[?62;22c\x1b[12;")); got != nil {
-		t.Fatalf("got %q", got)
-	}
-	if got := d.filter([]byte("1R\x1b[0")); got != nil {
-		t.Fatalf("got %q", got)
+	// Replies are dropped, even when split across reads, up to our own answer.
+	for _, in := range []string{"\x1b[?62;22c\x1b[12;", "1R\x1b[0"} {
+		if got := d.filter([]byte(in)); got != nil {
+			t.Fatalf("got %q", got)
+		}
 	}
 	if got := d.filter([]byte("nls")); string(got) != "ls" {
 		t.Fatalf("got %q", got)
@@ -133,22 +94,5 @@ func TestReplyDrain(t *testing.T) {
 	d.deadline = time.Now().Add(-time.Second)
 	if got := d.filter([]byte("y")); string(got) != "y" {
 		t.Fatal("expired drain must pass input through")
-	}
-}
-
-func TestModeTracker(t *testing.T) {
-	var m modeTracker
-	m.observe([]byte("hi\x1b[?1049hvim"))
-	if !m.altScreen {
-		t.Fatal("want alt screen")
-	}
-	m.observe([]byte("\x1b[?104"))
-	m.observe([]byte("9l$ "))
-	if m.altScreen {
-		t.Fatal("split leave sequence not recognized")
-	}
-	m.observe([]byte("\x1b[?1049h...\x1b[?1049l...\x1b[?1049h"))
-	if !m.altScreen {
-		t.Fatal("last sequence should win")
 	}
 }

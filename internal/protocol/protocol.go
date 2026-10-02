@@ -24,12 +24,16 @@ const (
 	MsgExit
 	MsgPing
 	MsgPong
+	MsgRole
+	MsgKill // ask the server to terminate the session; no reply
 )
 
-// Status codes carried in the first byte of the server's MsgHello reply.
+// Roles of an attached client, carried in the first byte of the server's
+// MsgHello reply and in MsgRole. Only the writer's input and terminal size
+// reach the session; read-only clients just watch its output.
 const (
-	HelloOK   byte = 0
-	HelloBusy byte = 1
+	RoleWriter   byte = 0
+	RoleReadOnly byte = 1
 )
 
 // MaxPayload bounds the size of a single frame so a corrupt or hostile peer
@@ -74,7 +78,30 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 	return hdr[0], payload, nil
 }
 
-// Resize is the payload of MsgResize and of the client's MsgHello.
+// Hello is the payload of the client's MsgHello: its terminal size, and
+// whether it only wants to watch.
+type Hello struct {
+	Rows, Cols uint16
+	ReadOnly   bool
+}
+
+func (h Hello) Encode() []byte {
+	b := Resize{Rows: h.Rows, Cols: h.Cols}.Encode()
+	if h.ReadOnly {
+		return append(b, 1)
+	}
+	return append(b, 0)
+}
+
+func DecodeHello(p []byte) (Hello, error) {
+	if len(p) != 5 {
+		return Hello{}, fmt.Errorf("protocol: bad hello length %d", len(p))
+	}
+	r, _ := DecodeResize(p[:4])
+	return Hello{Rows: r.Rows, Cols: r.Cols, ReadOnly: p[4] != 0}, nil
+}
+
+// Resize is the payload of MsgResize.
 type Resize struct {
 	Rows uint16
 	Cols uint16
@@ -97,17 +124,17 @@ func DecodeResize(p []byte) (Resize, error) {
 	}, nil
 }
 
-// HelloReply is the server's answer to a client's MsgHello. When the status is
-// HelloOK, the server follows it with exactly ReplayLen bytes of buffered
-// output (in MsgOutput frames) before streaming live output.
+// HelloReply is the server's answer to a client's MsgHello: the client's
+// initial role, then exactly ReplayLen bytes of buffered output (in MsgOutput
+// frames) before live output is streamed.
 type HelloReply struct {
-	Status    byte
+	Role      byte
 	ReplayLen uint32
 }
 
 func (h HelloReply) Encode() []byte {
 	b := make([]byte, 5)
-	b[0] = h.Status
+	b[0] = h.Role
 	binary.BigEndian.PutUint32(b[1:], h.ReplayLen)
 	return b
 }
@@ -116,7 +143,7 @@ func DecodeHelloReply(p []byte) (HelloReply, error) {
 	if len(p) != 5 {
 		return HelloReply{}, fmt.Errorf("protocol: bad hello reply length %d", len(p))
 	}
-	return HelloReply{Status: p[0], ReplayLen: binary.BigEndian.Uint32(p[1:])}, nil
+	return HelloReply{Role: p[0], ReplayLen: binary.BigEndian.Uint32(p[1:])}, nil
 }
 
 // EncodeExit encodes the shell's exit code for MsgExit.

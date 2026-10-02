@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,7 +33,14 @@ type Outcome struct {
 	ExitCode int
 }
 
-var ErrBusy = errors.New("session is already attached")
+// While read-only, the terminal title says so: the screen belongs to the
+// session, so nothing can be drawn on it. The title is pushed on the
+// terminal's title stack and popped when the client can write again.
+const (
+	titlePush     = "\x1b[22;2t"
+	titlePop      = "\x1b[23;2t"
+	readOnlyTitle = "\x1b]2;moor: read-only\x07"
+)
 
 // resetModes undoes terminal modes a program in the session may have enabled,
 // so the local terminal is usable after detaching: cursor visible, mouse
@@ -48,7 +56,11 @@ const clearScreen = "\x1b[H\x1b[2J\x1b[3J"
 // Attach connects the terminal on stdin/stdout to the session server
 // listening on sock and runs until detach, shell exit or disconnect. The
 // local terminal state is always restored before it returns.
-func Attach(sock string) (Outcome, error) {
+//
+// Several terminals may be attached at once. The newest one that did not ask
+// for readOnly controls the session; the others only watch, and regain
+// control when the newer ones detach.
+func Attach(sock string, readOnly bool) (Outcome, error) {
 	in, out := os.Stdin, os.Stdout
 	fd := int(in.Fd())
 	if !term.IsTerminal(fd) {
@@ -62,7 +74,8 @@ func Attach(sock string) (Outcome, error) {
 	defer conn.Close()
 
 	rows, cols := TermSize(fd)
-	if err := protocol.WriteFrame(conn, protocol.MsgHello, protocol.Resize{Rows: rows, Cols: cols}.Encode()); err != nil {
+	if err := protocol.WriteFrame(conn, protocol.MsgHello,
+		protocol.Hello{Rows: rows, Cols: cols, ReadOnly: readOnly}.Encode()); err != nil {
 		return Outcome{}, err
 	}
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -81,16 +94,19 @@ func Attach(sock string) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
-	if hello.Status == protocol.HelloBusy {
-		return Outcome{}, ErrBusy
-	}
 
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return Outcome{}, err
 	}
 	modes := &modeTracker{}
+	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4)}
 	restore := sync.OnceFunc(func() {
+		a.setRole(protocol.RoleWriter) // pops the read-only title
+		// Once the terminal is restored, nothing else may be written to it.
+		a.outMu.Lock()
+		defer a.outMu.Unlock()
+		a.closed = true
 		reset := resetModes
 		if modes.altScreen {
 			// Pop the alternate screen's keyboard flags, leave it, then
@@ -102,13 +118,12 @@ func Attach(sock string) (Outcome, error) {
 	})
 	defer restore()
 
-	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4)}
-
 	// Start from a blank screen and scrollback, so the terminal shows only
 	// the session: its buffered output is replayed into the empty
 	// scrollback. Then make sure terminal answers to any queries in the
 	// replay are not mistaken for typing.
 	out.WriteString(clearScreen)
+	a.setRole(hello.Role)
 	for remaining := int(hello.ReplayLen); remaining > 0; {
 		typ, payload, err := protocol.ReadFrame(conn)
 		if err != nil {
@@ -118,6 +133,10 @@ func Attach(sock string) (Outcome, error) {
 		case protocol.MsgOutput:
 			a.write(payload)
 			remaining -= len(payload)
+		case protocol.MsgRole:
+			if len(payload) == 1 {
+				a.setRole(payload[0])
+			}
 		case protocol.MsgExit:
 			return Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)}, nil
 		}
@@ -163,6 +182,18 @@ type attachment struct {
 
 	sendMu sync.Mutex
 
+	// outMu serializes writes to the terminal, and closed stops them once
+	// the terminal has been restored. It also guards modes.
+	outMu  sync.Mutex
+	closed bool
+
+	// writer is whether this client controls the session. While it does
+	// not, input is discarded except for the detach key. titled is whether
+	// the read-only title is showing; roleMu guards it.
+	writer atomic.Bool
+	roleMu sync.Mutex
+	titled bool
+
 	// mu guards filter, drain and timer.
 	mu     sync.Mutex
 	filter detachFilter
@@ -179,6 +210,28 @@ func (a *attachment) send(typ byte, payload []byte) {
 	}
 }
 
+func (a *attachment) setRole(role byte) {
+	a.roleMu.Lock()
+	defer a.roleMu.Unlock()
+	writer := role == protocol.RoleWriter
+	a.writer.Store(writer)
+	switch {
+	case !writer && !a.titled:
+		a.titled = true
+		a.emit([]byte(titlePush + readOnlyTitle))
+	case writer && a.titled:
+		a.titled = false
+		a.emit([]byte(titlePop))
+	}
+}
+
+// forward sends keyboard input to the session if this client may write.
+func (a *attachment) forward(p []byte) {
+	if len(p) > 0 && a.writer.Load() {
+		a.send(protocol.MsgInput, p)
+	}
+}
+
 func (a *attachment) finish(o Outcome) {
 	select {
 	case a.done <- o:
@@ -186,9 +239,23 @@ func (a *attachment) finish(o Outcome) {
 	}
 }
 
+// write sends session output to the terminal, tracking its mode changes.
 func (a *attachment) write(p []byte) {
-	a.modes.observe(p)
-	a.out.Write(p)
+	a.outMu.Lock()
+	defer a.outMu.Unlock()
+	if !a.closed {
+		a.modes.observe(p)
+		a.out.Write(p)
+	}
+}
+
+// emit sends our own escape sequences to the terminal.
+func (a *attachment) emit(p []byte) {
+	a.outMu.Lock()
+	defer a.outMu.Unlock()
+	if !a.closed {
+		a.out.Write(p)
+	}
 }
 
 func (a *attachment) readServer() {
@@ -201,6 +268,10 @@ func (a *attachment) readServer() {
 		switch typ {
 		case protocol.MsgOutput:
 			a.write(payload)
+		case protocol.MsgRole:
+			if len(payload) == 1 {
+				a.setRole(payload[0])
+			}
 		case protocol.MsgExit:
 			a.finish(Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)})
 			return
@@ -234,9 +305,7 @@ func (a *attachment) handleInput(p []byte) bool {
 		a.armTimer(a.filter.epoch)
 	}
 	a.mu.Unlock()
-	if len(fwd) > 0 {
-		a.send(protocol.MsgInput, fwd)
-	}
+	a.forward(fwd)
 	return detach
 }
 
@@ -253,9 +322,7 @@ func (a *attachment) armTimer(epoch int) {
 			fwd = a.filter.flush()
 		}
 		a.mu.Unlock()
-		if len(fwd) > 0 {
-			a.send(protocol.MsgInput, fwd)
-		}
+		a.forward(fwd)
 	})
 }
 

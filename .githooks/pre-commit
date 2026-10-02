@@ -1,0 +1,7 @@
+#!/bin/sh
+# Enable with: make hooks
+set -e
+unformatted="$(gofmt -l .)"
+[ -z "$unformatted" ] || { echo "gofmt needed:" >&2; echo "$unformatted" >&2; exit 1; }
+go vet ./...
+go test ./...

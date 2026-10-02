@@ -20,7 +20,7 @@ type Meta struct {
 	CreatedAt time.Time `json:"created_at"`
 	CWD       string    `json:"cwd"`
 	Command   string    `json:"command,omitempty"`
-	Attached  bool      `json:"attached"`
+	Clients   int       `json:"clients"` // attached clients
 }
 
 const (
