@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -61,6 +62,41 @@ const resetModes = "\x1b[<99u\x1b[>4m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005
 // clearScreen homes the cursor and erases the screen and the scrollback.
 const clearScreen = "\x1b[H\x1b[2J\x1b[3J"
 
+// handshake connects to the session server and sends the hello, returning the
+// connection and the server's first reply. A server from an older moor
+// version closes the connection on a hello it cannot parse; the hello is then
+// sent once more in the older format.
+func handshake(sock string, hello protocol.Hello) (conn net.Conn, typ byte, payload []byte, legacy bool, err error) {
+	for {
+		conn, err = net.DialTimeout("unix", sock, 2*time.Second)
+		if err != nil {
+			return nil, 0, nil, false, fmt.Errorf("connecting to session: %w", err)
+		}
+		enc := hello.Encode()
+		if legacy {
+			enc = hello.EncodeLegacy()
+		}
+		err = protocol.WriteFrame(conn, protocol.MsgHello, enc)
+		if err == nil {
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			typ, payload, err = protocol.ReadFrame(conn)
+			conn.SetReadDeadline(time.Time{})
+		}
+		if err == nil {
+			return conn, typ, payload, legacy, nil
+		}
+		conn.Close()
+		closed := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+		if !closed {
+			return nil, 0, nil, false, fmt.Errorf("session did not answer: %w", err)
+		}
+		if legacy {
+			return nil, 0, nil, false, errors.New("the session server does not understand this moor version; end the session with 'moor kill' and start a new one")
+		}
+		legacy = true
+	}
+}
+
 // Attach connects the terminal on stdin/stdout to the session server
 // listening on sock and runs until detach, shell exit or disconnect. The
 // local terminal state is always restored before it returns.
@@ -75,23 +111,12 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 		return Outcome{}, errors.New("stdin is not a terminal")
 	}
 
-	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("connecting to session: %w", err)
-	}
-	defer conn.Close()
-
 	size := TermSize(fd)
-	if err := protocol.WriteFrame(conn, protocol.MsgHello,
-		protocol.Hello{Size: size, ReadOnly: readOnly}.Encode()); err != nil {
+	conn, typ, payload, legacy, err := handshake(sock, protocol.Hello{Size: size, ReadOnly: readOnly})
+	if err != nil {
 		return Outcome{}, err
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	typ, payload, err := protocol.ReadFrame(conn)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("session did not answer: %w", err)
-	}
-	conn.SetReadDeadline(time.Time{})
+	defer conn.Close()
 	if typ == protocol.MsgExit {
 		return Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)}, nil
 	}
@@ -114,7 +139,7 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 		return Outcome{}, err
 	}
 	modes := &modeTracker{}
-	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4)}
+	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4), legacy: legacy}
 	restore := sync.OnceFunc(func() {
 		a.setRole(protocol.RoleWriter) // pops the read-only title
 		// Once the terminal is restored, nothing else may be written to it.
@@ -186,11 +211,11 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	defer close(stop)
 	watchResize(fd, func(r protocol.Resize) {
 		defer a.recoverRestore()
-		a.send(protocol.MsgResize, r.Encode())
+		a.sendResize(r)
 	}, stop)
 	// The terminal may have been resized between the hello and raw mode.
 	if now := TermSize(fd); now != size {
-		a.send(protocol.MsgResize, now.Encode())
+		a.sendResize(now)
 	}
 
 	go a.readServer()
@@ -208,6 +233,10 @@ type attachment struct {
 	out   *os.File
 	modes *modeTracker
 	done  chan Outcome
+
+	// legacy is set when the session server predates pixel sizes and needs
+	// the older, shorter size messages.
+	legacy bool
 
 	// restore puts the terminal back; see recoverRestore.
 	restore func()
@@ -241,6 +270,14 @@ func (a *attachment) recoverRestore() {
 		a.restore()
 		panic(r)
 	}
+}
+
+func (a *attachment) sendResize(r protocol.Resize) {
+	if a.legacy {
+		a.send(protocol.MsgResize, r.EncodeLegacy())
+		return
+	}
+	a.send(protocol.MsgResize, r.Encode())
 }
 
 func (a *attachment) send(typ byte, payload []byte) {
@@ -345,7 +382,7 @@ func (a *attachment) handleInput(p []byte) bool {
 	p = a.drain.filter(p)
 	epoch := a.filter.epoch
 	fwd, detach := a.filter.feed(p)
-	if !detach && a.filter.pending() && a.filter.epoch != epoch {
+	if !detach && a.filter.timed() && a.filter.epoch != epoch {
 		a.armTimer(a.filter.epoch)
 	}
 	a.mu.Unlock()
@@ -353,7 +390,7 @@ func (a *attachment) handleInput(p []byte) bool {
 	return detach
 }
 
-// armTimer releases a held-back Ctrl-\ or Ctrl-b after detachTimeout, unless the
+// armTimer releases a held-back Ctrl-\ after detachTimeout, unless the
 // filter has moved on to a newer pending state by then. Caller holds a.mu.
 func (a *attachment) armTimer(epoch int) {
 	if a.timer != nil {

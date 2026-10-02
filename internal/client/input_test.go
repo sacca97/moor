@@ -36,7 +36,8 @@ func TestDetachFilter(t *testing.T) {
 		"ctrl-b d in one read":   {{in: "ls\r\x02d", out: "ls\r", detach: true}},
 		"ctrl-b other key":       {{in: "\x02"}, {in: "x", out: "\x02x"}, {in: "d", out: "d"}},
 		"ctrl-b then ctrl-\\":    {{in: "\x02"}, {in: bs, out: "\x02"}, {in: bs, detach: true}},
-		"ctrl-b twice":           {{in: "\x02"}, {in: "\x02", out: "\x02"}, {in: "d", detach: true}},
+		"ctrl-b twice":           {{in: "\x02"}, {in: "\x02", out: "\x02"}, {in: "d", out: "d"}},
+		"ctrl-b then arrow":      {{in: "\x02"}, {in: "\x1b[A", out: "\x02\x1b[A"}},
 		"d alone":                {{in: "d", out: "d"}},
 		"ctrl-b kitty":           {{in: "\x1b[98;5u"}, {in: "\x1b[98;5:3u"}, {in: "\x1b[100u", detach: true}},
 		"ctrl-b modifyOtherKeys": {{in: "\x1b[27;5;98~"}, {in: "d", detach: true}},
@@ -76,6 +77,33 @@ func TestDetachHoldAndFlush(t *testing.T) {
 	f.feed([]byte(bs))
 	if f.epoch != e+2 || !f.pending() {
 		t.Fatal("a new press must start a new epoch")
+	}
+}
+
+// Ctrl-b waits for its key with no timeout, like tmux's prefix; Ctrl-\\ is timed.
+func TestPrefixHasNoTimeout(t *testing.T) {
+	f := &detachFilter{}
+	f.feed([]byte("\x02"))
+	if !f.pending() || f.timed() {
+		t.Fatal("a held Ctrl-b should wait without a timer")
+	}
+	if out, detach := f.feed([]byte("d")); len(out) != 0 || !detach {
+		t.Fatalf("d after Ctrl-b: out %q, detach %v", out, detach)
+	}
+	f.feed([]byte(bs))
+	if !f.timed() {
+		t.Fatal("a held Ctrl-\\ should be timed")
+	}
+	f.flush()
+	// Ctrl-b followed by half an escape sequence is timed, so it cannot hang.
+	f.feed([]byte("\x02"))
+	e := f.epoch
+	f.feed([]byte("\x1b["))
+	if !f.timed() || f.epoch == e {
+		t.Fatal("a partial sequence after Ctrl-b needs a timer")
+	}
+	if got := string(f.flush()); got != "\x02\x1b[" {
+		t.Fatalf("flush = %q", got)
 	}
 }
 

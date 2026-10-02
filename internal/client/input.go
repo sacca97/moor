@@ -13,8 +13,9 @@ const (
 	prefixByte = 0x02 // Ctrl-b
 )
 
-// detachTimeout is how long a Ctrl-\ or Ctrl-b is held back waiting for the
-// key that completes the detach sequence.
+// detachTimeout is how long a Ctrl-\ is held back waiting for a second one.
+// Ctrl-b, the prefix key, is different: as in tmux it waits for the next key
+// for as long as it takes, which a touch keyboard needs.
 // If it expires, the Ctrl-\ is forwarded to the session.
 const detachTimeout = 400 * time.Millisecond
 
@@ -27,9 +28,11 @@ var (
 // Ctrl-b d as in tmux.
 //
 // A Ctrl-\ or Ctrl-b press is held back rather than forwarded. Ctrl-\ then
-// Ctrl-\, or Ctrl-b then d, means detach; any other key releases the held
-// press followed by that key, and a timeout releases it alone. All other
-// input, Esc included, passes through without delay.
+// Ctrl-\, or Ctrl-b then d, means detach. After Ctrl-b, as after tmux's
+// prefix, the filter waits for the next key with no timeout; Ctrl-b Ctrl-b
+// sends a single literal Ctrl-b, and any other key is forwarded after the
+// Ctrl-b. A lone Ctrl-\ is released after a timeout, or by the next key.
+// All other input, Esc included, passes through without delay.
 //
 // Besides the raw bytes, the keys are recognized in the encodings terminals
 // use when a program enables extended keyboard reporting: the kitty keyboard
@@ -39,7 +42,8 @@ var (
 // suspended inside bracketed pastes.
 //
 // detachFilter does no timing itself; the caller calls flush after
-// detachTimeout whenever a feed starts a new pending state (see epoch).
+// detachTimeout whenever a feed starts a new pending state that is timed (see
+// epoch and timed).
 type detachFilter struct {
 	seq     []byte // incomplete escape sequence
 	held    []byte // a held Ctrl-\ or Ctrl-b press (plus any key releases after it)
@@ -97,11 +101,14 @@ func (f *detachFilter) feed(p []byte) (out []byte, detach bool) {
 		}
 	}
 	// An incomplete sequence at the end of a read is almost always a lone
-	// Esc key. Forward it now rather than delaying Esc; only while a Ctrl-\
-	// is held is it kept, in case it begins the second press.
+	// Esc key. Forward it now rather than delaying Esc; only while a press
+	// is held is it kept, in case it begins the second key.
 	if len(f.seq) > 0 && len(f.held) == 0 {
 		out = append(out, f.seq...)
 		f.seq = f.seq[:0]
+	}
+	if len(f.seq) > 0 && f.prefix {
+		f.epoch++ // the untimed Ctrl-b wait now has a half-key that needs a timeout
 	}
 	return out, false
 }
@@ -120,6 +127,10 @@ func (f *detachFilter) emit(out, tok []byte) ([]byte, bool) {
 		case ev == detachPress && !f.prefix, ev == dKey && f.prefix:
 			f.reset()
 			return out, true
+		case ev == prefixPress && f.prefix:
+			// Ctrl-b Ctrl-b sends one literal Ctrl-b, as in tmux.
+			f.reset()
+			return append(out, tok...), false
 		case ev == keyRelease:
 			f.held = append(f.held, tok...)
 			return out, false
@@ -143,6 +154,13 @@ func (f *detachFilter) emit(out, tok []byte) ([]byte, bool) {
 }
 
 func (f *detachFilter) pending() bool { return len(f.seq) > 0 || len(f.held) > 0 }
+
+// timed reports whether what is held back must be released after
+// detachTimeout. A Ctrl-b waiting for its key is not: it waits indefinitely,
+// unless a partial escape sequence is also pending.
+func (f *detachFilter) timed() bool {
+	return f.pending() && (!f.prefix || len(f.seq) > 0)
+}
 
 // flush releases everything held back. The caller invokes it when
 // detachTimeout expires.

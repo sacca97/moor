@@ -28,16 +28,29 @@ ZDOTDIR=$_moor_zd
 unset _moor_zd
 `
 
-const zshrc = `if [[ -n $MOOR_USER_ZDOTDIR ]]; then ZDOTDIR=$MOOR_USER_ZDOTDIR; else unset ZDOTDIR; fi
+// venvSh re-activates the virtualenv moor was started from, after the user's
+// startup files have run. The environment is inherited as is, but activation
+// is more than variables: the files may put other directories ahead of the
+// venv on PATH, and the shell never saw "deactivate" or the prompt prefix.
+const venvSh = `if [ -n "${VIRTUAL_ENV-}" ] && [ -r "$VIRTUAL_ENV/bin/activate" ]; then . "$VIRTUAL_ENV/bin/activate"; fi
+`
+
+// Each shell's rc is the user's own files, the venv hook, and (unless
+// MOOR_PROMPT=0) the prompt marker, in that order.
+const zshrcHead = `if [[ -n $MOOR_USER_ZDOTDIR ]]; then ZDOTDIR=$MOOR_USER_ZDOTDIR; else unset ZDOTDIR; fi
 unset MOOR_USER_ZDOTDIR
 [[ -r ${ZDOTDIR:-$HOME}/.zshrc ]] && source ${ZDOTDIR:-$HOME}/.zshrc
-typeset -g _moor_mark=$'%{\e[2m%}[@MARK@]%{\e[22m%} '
+` + venvSh
+
+const zshrcPrompt = `typeset -g _moor_mark=$'%{\e[2m%}[@MARK@]%{\e[22m%} '
 _moor_prompt() { [[ $PROMPT == *$_moor_mark* ]] || PROMPT="$_moor_mark$PROMPT" }
 precmd_functions+=(_moor_prompt)
 `
 
-const bashrc = `[ -r ~/.bashrc ] && . ~/.bashrc
-_moor_mark='\[\e[2m\][@MARK@]\[\e[22m\] '
+const bashrcHead = `[ -r ~/.bashrc ] && . ~/.bashrc
+` + venvSh
+
+const bashrcPrompt = `_moor_mark='\[\e[2m\][@MARK@]\[\e[22m\] '
 _moor_prompt() { case "$PS1" in *"$_moor_mark"*) ;; *) PS1="$_moor_mark$PS1" ;; esac; }
 if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
   PROMPT_COMMAND+=(_moor_prompt)
@@ -46,7 +59,12 @@ else
 fi
 `
 
-const fishInit = `if functions -q fish_prompt
+const fishHead = `if set -q VIRTUAL_ENV; and test -r $VIRTUAL_ENV/bin/activate.fish
+    source $VIRTUAL_ENV/bin/activate.fish
+end
+`
+
+const fishPrompt = `if functions -q fish_prompt
     functions -c fish_prompt _moor_orig_prompt
 else
     function _moor_orig_prompt; end
@@ -60,26 +78,34 @@ function fish_prompt
 end
 `
 
-// shellCommand returns the command that starts shell interactively with the
-// prompt marker for session name. dir is the session's runtime directory,
-// where the wrapper files are written.
+// shellCommand returns the command that starts shell interactively, wrapped
+// so that it shows the prompt marker for session name (unless MOOR_PROMPT=0)
+// and re-activates the virtualenv moor was started from, if any. dir is the
+// session's runtime directory, where the wrapper files are written.
 func shellCommand(shell, name, dir string) *exec.Cmd {
 	plain := exec.Command(shell)
-	if os.Getenv("MOOR_PROMPT") == "0" || name == "" {
+	marker := os.Getenv("MOOR_PROMPT") != "0" && name != ""
+	if !marker && os.Getenv("VIRTUAL_ENV") == "" {
 		return plain
 	}
 	mark := "moor"
 	if !session.IsDefaultName(name) {
 		mark += ":" + name
 	}
-	render := func(s string) []byte { return []byte(strings.ReplaceAll(s, "@MARK@", mark)) }
+	// rc builds a shell's startup file from its parts.
+	rc := func(head, prompt string) []byte {
+		if marker {
+			head += prompt
+		}
+		return []byte(strings.ReplaceAll(head, "@MARK@", mark))
+	}
 
 	switch strings.TrimPrefix(filepath.Base(shell), "-") {
 	case "zsh":
 		zdir := filepath.Join(dir, "zsh")
 		if os.Mkdir(zdir, 0o700) != nil ||
-			os.WriteFile(filepath.Join(zdir, ".zshenv"), render(zshenv), 0o600) != nil ||
-			os.WriteFile(filepath.Join(zdir, ".zshrc"), render(zshrc), 0o600) != nil {
+			os.WriteFile(filepath.Join(zdir, ".zshenv"), []byte(zshenv), 0o600) != nil ||
+			os.WriteFile(filepath.Join(zdir, ".zshrc"), rc(zshrcHead, zshrcPrompt), 0o600) != nil {
 			return plain
 		}
 		cmd := exec.Command(shell)
@@ -89,17 +115,17 @@ func shellCommand(shell, name, dir string) *exec.Cmd {
 		}
 		return cmd
 	case "bash":
-		rc := filepath.Join(dir, "bashrc")
-		if os.WriteFile(rc, render(bashrc), 0o600) != nil {
+		path := filepath.Join(dir, "bashrc")
+		if os.WriteFile(path, rc(bashrcHead, bashrcPrompt), 0o600) != nil {
 			return plain
 		}
-		return exec.Command(shell, "--rcfile", rc)
+		return exec.Command(shell, "--rcfile", path)
 	case "fish":
-		init := filepath.Join(dir, "prompt.fish")
-		if os.WriteFile(init, render(fishInit), 0o600) != nil {
+		path := filepath.Join(dir, "prompt.fish")
+		if os.WriteFile(path, rc(fishHead, fishPrompt), 0o600) != nil {
 			return plain
 		}
-		return exec.Command(shell, "-C", "source '"+strings.ReplaceAll(init, "'", `\'`)+"'")
+		return exec.Command(shell, "-C", "source '"+strings.ReplaceAll(path, "'", `\'`)+"'")
 	}
 	return plain
 }

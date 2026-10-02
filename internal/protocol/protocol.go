@@ -79,6 +79,13 @@ func ReadFrame(r io.Reader) (byte, []byte, error) {
 	return hdr[0], payload, nil
 }
 
+// Wire compatibility. Payloads only ever grow by appending fields, and
+// decoders accept the shorter forms that older moor versions send as well as
+// longer ones from newer versions (extra bytes are ignored), so a running
+// session server and a freshly installed client can still talk. The first
+// release sent terminal sizes without pixels (4 bytes) and a hello of
+// size + read-only flag (5 bytes).
+
 // Hello is the payload of the client's MsgHello: its terminal size, and
 // whether it only wants to watch.
 type Hello struct {
@@ -88,18 +95,34 @@ type Hello struct {
 
 func (h Hello) Encode() []byte {
 	b := h.Size.Encode()
-	if h.ReadOnly {
-		return append(b, 1)
-	}
-	return append(b, 0)
+	return append(b, boolByte(h.ReadOnly))
+}
+
+// EncodeLegacy is the hello older servers understand: no pixel size.
+func (h Hello) EncodeLegacy() []byte {
+	return append(h.Size.EncodeLegacy(), boolByte(h.ReadOnly))
 }
 
 func DecodeHello(p []byte) (Hello, error) {
-	if len(p) != resizeSize+1 {
-		return Hello{}, fmt.Errorf("protocol: bad hello length %d", len(p))
+	switch {
+	case len(p) == legacyResizeSize: // before the read-only flag existed
+		r, _ := DecodeResize(p)
+		return Hello{Size: r}, nil
+	case len(p) == legacyResizeSize+1:
+		r, _ := DecodeResize(p[:legacyResizeSize])
+		return Hello{Size: r, ReadOnly: p[legacyResizeSize] != 0}, nil
+	case len(p) >= resizeSize+1:
+		r, _ := DecodeResize(p[:resizeSize])
+		return Hello{Size: r, ReadOnly: p[resizeSize] != 0}, nil
 	}
-	r, _ := DecodeResize(p[:resizeSize])
-	return Hello{Size: r, ReadOnly: p[resizeSize] != 0}, nil
+	return Hello{}, fmt.Errorf("protocol: bad hello length %d", len(p))
+}
+
+func boolByte(v bool) byte {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // Resize is a terminal size, the payload of MsgResize. The pixel size is
@@ -109,7 +132,10 @@ type Resize struct {
 	XPixel, YPixel uint16
 }
 
-const resizeSize = 8
+const (
+	legacyResizeSize = 4 // rows and columns only
+	resizeSize       = 8
+)
 
 func (r Resize) Encode() []byte {
 	b := make([]byte, resizeSize)
@@ -120,16 +146,19 @@ func (r Resize) Encode() []byte {
 	return b
 }
 
+// EncodeLegacy is the size older servers understand: rows and columns only.
+func (r Resize) EncodeLegacy() []byte { return r.Encode()[:legacyResizeSize] }
+
 func DecodeResize(p []byte) (Resize, error) {
-	if len(p) != resizeSize {
+	if len(p) != legacyResizeSize && len(p) < resizeSize {
 		return Resize{}, fmt.Errorf("protocol: bad resize payload length %d", len(p))
 	}
-	return Resize{
-		Rows:   binary.BigEndian.Uint16(p[0:]),
-		Cols:   binary.BigEndian.Uint16(p[2:]),
-		XPixel: binary.BigEndian.Uint16(p[4:]),
-		YPixel: binary.BigEndian.Uint16(p[6:]),
-	}, nil
+	r := Resize{Rows: binary.BigEndian.Uint16(p[0:]), Cols: binary.BigEndian.Uint16(p[2:])}
+	if len(p) >= resizeSize {
+		r.XPixel = binary.BigEndian.Uint16(p[4:])
+		r.YPixel = binary.BigEndian.Uint16(p[6:])
+	}
+	return r, nil
 }
 
 // HelloReply is the server's answer to a client's MsgHello: the client's

@@ -19,6 +19,7 @@ import (
 	"github.com/sacca/moor/internal/client"
 	"github.com/sacca/moor/internal/server"
 	"github.com/sacca/moor/internal/session"
+	"github.com/sacca/moor/internal/update"
 )
 
 const usage = `moor - moor a shell so it stays alive, then attach and detach at will
@@ -31,14 +32,18 @@ Usage:
                                  same as start, but stay detached
   moor [-r] [-n NAME] . | cwd    attach to the session started in this directory,
                                  or create one named after it
-  moor attach [-r] [ID|NAME]     attach to a session (also: moor a, moor -a ID|NAME);
-                                 with no argument, attach to the only session
+  moor attach [-r] [ID|NAME]     attach to a session (also: moor a, moor -a [ID|NAME]);
+                                 with no argument, the only session, or the lowest ID
   moor ps                        list sessions
   moor rename ID|NAME NEWNAME    rename a session
   moor kill ID|NAME              terminate a session
+  moor update                    install the latest release
   moor --version                 print the version
 
 Press Ctrl-\ twice, or Ctrl-b d, to detach. The shell keeps running.
+
+moor looks for a newer release once a day and, after you detach, offers to
+install it; set MOOR_NO_UPDATE_CHECK=1 to turn that off.
 
 A session can have several terminals attached. The newest one controls it; the
 others are read-only until it detaches. With -r, a terminal only watches.
@@ -57,17 +62,50 @@ func Main(args []string) int {
 	if len(args) > 0 && args[0] == "__serve" {
 		return serve(args[1:])
 	}
-	err := run(args)
-	if err == nil {
+	if len(args) > 0 && args[0] == update.RefreshCommand {
+		if update.Refresh() != nil {
+			return 1
+		}
 		return 0
 	}
-	fmt.Fprintf(os.Stderr, "moor: %v\n", err)
-	var ue usageError
-	if errors.As(err, &ue) {
-		fmt.Fprint(os.Stderr, "\n"+usage)
-		return 2
+	err := run(args)
+	code := 0
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "moor: %v\n", err)
+		code = 1
+		var ue usageError
+		if errors.As(err, &ue) {
+			fmt.Fprint(os.Stderr, "\n"+usage)
+			code = 2
+		}
 	}
-	return 1
+	// After the command, so the question is not wiped by an attach.
+	if err == nil && !isInfoCommand(args) && !isUpdate(args) {
+		if latest := update.Check(Version); latest != "" {
+			if attached {
+				update.Offer(latest, Version)
+			} else {
+				fmt.Fprintf(os.Stderr, "moor %s is available (you have %s). Update with: moor update\n", latest, Version)
+			}
+		}
+	}
+	return code
+}
+
+// attached is set once the user has been attached to a session, which makes
+// a good moment to offer an update.
+var attached bool
+
+func isUpdate(args []string) bool { return len(args) > 0 && args[0] == "update" }
+
+// isInfoCommand is true for commands that only print help or the version.
+func isInfoCommand(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" || a == "help" || a == "--version" || a == "version" {
+			return true
+		}
+	}
+	return false
 }
 
 func run(args []string) error {
@@ -93,11 +131,12 @@ func run(args []string) error {
 		case strings.HasPrefix(a, "--name="):
 			name, nameSet = strings.TrimPrefix(a, "--name="), true
 		case a == "-a" || a == "--attach":
-			if i+1 >= len(args) {
-				return usageError(a + " requires a session ID or name")
+			attachSet = true
+			// The target is optional: without one, the default session.
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				attach = args[i]
 			}
-			i++
-			attach, attachSet = args[i], true
 		case strings.HasPrefix(a, "--attach="):
 			attach, attachSet = strings.TrimPrefix(a, "--attach="), true
 		case a == "-r" || a == "--read-only":
@@ -120,8 +159,15 @@ parsed:
 		}
 	}
 	if attachSet {
+		// "-a -r NAME": the target may follow the other flags.
+		if attach == "" && len(rest) == 1 {
+			attach, rest = rest[0], nil
+		}
 		if nameSet || len(rest) > 0 {
 			return usageError("-a takes no other arguments except -r")
+		}
+		if attach == "" {
+			return cmdAttachDefault(readOnly)
 		}
 		return cmdAttach(attach, readOnly)
 	}
@@ -162,7 +208,7 @@ parsed:
 			return usageError("usage: moor attach [-r] [ID|NAME]")
 		}
 		if len(targets) == 0 {
-			return cmdAttachOnly(readOnly)
+			return cmdAttachDefault(readOnly)
 		}
 		return cmdAttach(targets[0], readOnly)
 	case "ps", "ls", "list":
@@ -180,6 +226,11 @@ parsed:
 			return usageError("usage: moor kill ID|NAME")
 		}
 		return cmdKill(rest[1])
+	case "update":
+		if nameSet || len(rest) != 1 {
+			return usageError("usage: moor update")
+		}
+		return update.Install()
 	case "version":
 		fmt.Println("moor", Version)
 		return nil
@@ -265,20 +316,22 @@ func cmdAttach(target string, readOnly bool) error {
 	return attachTo(s.ID, s.Name, readOnly)
 }
 
-// cmdAttachOnly attaches to the only session, or explains why it cannot.
-func cmdAttachOnly(readOnly bool) error {
+// cmdAttachDefault attaches without being told which session: the only one,
+// or with several, the lowest ID (session 0 unless it is gone). Inside a
+// session, that session itself is skipped when there are others.
+func cmdAttachDefault(readOnly bool) error {
 	sessions, err := session.List()
 	if err != nil {
 		return err
 	}
-	switch len(sessions) {
-	case 0:
+	if len(sessions) == 0 {
 		return errors.New("no sessions to attach to (start one with 'moor')")
-	case 1:
-		return attachTo(sessions[0].ID, sessions[0].Name, readOnly)
 	}
-	printSessions(os.Stderr, sessions)
-	return errors.New("several sessions; say which one: moor attach ID|NAME")
+	s := sessions[0] // List is sorted by ID
+	if cur := os.Getenv("MOOR_SESSION"); len(sessions) > 1 && cur == strconv.Itoa(s.ID) {
+		s = sessions[1]
+	}
+	return attachTo(s.ID, s.Name, readOnly)
 }
 
 func cmdRename(target, newName string) error {
@@ -294,6 +347,7 @@ func cmdRename(target, newName string) error {
 }
 
 func attachTo(id int, name string, readOnly bool) error {
+	attached = true
 	if os.Getenv("MOOR_SESSION") == strconv.Itoa(id) {
 		return fmt.Errorf("cannot attach session %d from inside itself", id)
 	}
@@ -346,13 +400,25 @@ func printSessions(w io.Writer, sessions []session.Meta) {
 		case s.Clients > 1:
 			state = fmt.Sprintf("attached (%d)", s.Clients)
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%s\t%s\n", s.ID, name, state, s.PID, age(time.Since(s.CreatedAt)), shellCwd(s))
+		pid, cwd := "-", "-"
+		if s.PID > 0 {
+			pid = strconv.Itoa(s.PID)
+		}
+		if s.CWD != "" || s.ShellPID > 0 {
+			cwd = shellCwd(s)
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", s.ID, name, state, pid, age(s.CreatedAt), cwd)
 	}
 	tw.Flush()
 }
 
-// age formats a duration with one unit: 45s, 34m, 2h, 3d.
-func age(d time.Duration) string {
+// age formats how long ago t was, with one unit: 45s, 34m, 2h, 3d. A zero
+// time (unreadable session metadata) is shown as "-".
+func age(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	d := time.Since(t)
 	switch {
 	case d < time.Minute:
 		return fmt.Sprintf("%ds", max(int(d.Seconds()), 0))

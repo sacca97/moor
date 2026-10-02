@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +27,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	binary = filepath.Join(dir, "moor")
-	out, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput()
+	out, err := exec.Command("go", "build", "-ldflags", "-X main.version=0.1.0", "-o", binary, ".").CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "building moor: %v\n%s", err, out)
 		os.Exit(1)
@@ -61,6 +63,7 @@ func newEnv(t *testing.T) *env {
 		"HOME="+root,
 		"PS1=dsh$ ",
 		"TERM=xterm-256color",
+		"MOOR_NO_UPDATE_CHECK=1", // the update test turns it back on
 	)
 	t.Cleanup(e.killAll)
 	return e
@@ -459,6 +462,32 @@ func TestDetachKeyEncodings(t *testing.T) {
 	}
 }
 
+// Like tmux's prefix, Ctrl-b waits for the next key however long it takes
+// (a touch keyboard is slow), and is otherwise passed through in order.
+func TestCtrlBWaitsForNextKey(t *testing.T) {
+	e := newEnv(t)
+	c := e.attachTerm(24, 80, "-n", "tmuxlike")
+	c.expect("dsh$ ")
+
+	// A key other than d: the Ctrl-b (backward-char in readline) is released
+	// before it, so X lands between b and c.
+	c.send("echo abc\x02")
+	time.Sleep(1200 * time.Millisecond)
+	c.send("X\r")
+	c.expect("abXc")
+
+	// Ctrl-b Ctrl-b sends exactly one Ctrl-b, one step back.
+	c.send("echo pqr\x02\x02X\r")
+	c.expect("pqXr")
+
+	// d detaches even after a long pause.
+	c.send("\x02")
+	time.Sleep(1500 * time.Millisecond)
+	c.send("d")
+	c.expect("[moor: detached")
+	c.waitExit()
+}
+
 // A program that switches to the alternate screen, with the sequence split
 // across writes, is left again on detach so the terminal is usable.
 func TestDetachLeavesAlternateScreen(t *testing.T) {
@@ -641,6 +670,129 @@ func TestPixelSizeReachesSession(t *testing.T) {
 	c.expect("ws (24, 80, 640, 480)")
 }
 
+// updateEnv is an environment with a (fake) newer release 9.9.9 on offer from
+// a local server, whose install script just records where it was told to
+// install.
+func updateEnv(t *testing.T) (e *env, marker string) {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/releases/tag/9.9.9", http.StatusFound)
+	})
+	e = newEnv(t)
+	marker = filepath.Join(e.root, "marker")
+	mux.HandleFunc("/install.sh", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "#!/bin/sh\necho \"script-ran dir=$MOOR_INSTALL_DIR\" | tee %s\n", marker)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	e.setVar("XDG_CACHE_HOME", filepath.Join(e.root, "cache"))
+	e.setVar("MOOR_UPDATE_URL", srv.URL+"/releases/latest")
+	e.setVar("MOOR_UPDATE_SCRIPT_URL", srv.URL+"/install.sh")
+	e.setVar("MOOR_NO_UPDATE_CHECK", "")
+	return e, marker
+}
+
+func (e *env) cacheFile() string { return filepath.Join(e.root, "cache", "moor", "update.json") }
+
+// A newer release is found in the background and announced after a later
+// command, once, and only on a terminal.
+func TestUpdateNotice(t *testing.T) {
+	e, _ := updateEnv(t)
+
+	// Not a terminal: no notice, and no check either.
+	if out := e.mustRun("ps"); strings.Contains(out, "available") {
+		t.Fatalf("notice without a terminal: %q", out)
+	}
+	if _, err := os.Stat(e.cacheFile()); err == nil {
+		t.Fatal("checked for updates without a terminal")
+	}
+
+	// The first command on a terminal starts the check but knows nothing yet.
+	c := e.attachTerm(24, 80, "ps")
+	c.waitExit()
+	if c.contains("available") {
+		t.Fatal("notice before anything was fetched")
+	}
+	var data []byte
+	for i := 0; i < 200 && !strings.Contains(string(data), "9.9.9"); i++ {
+		time.Sleep(25 * time.Millisecond)
+		data, _ = os.ReadFile(e.cacheFile())
+	}
+	if !strings.Contains(string(data), "9.9.9") {
+		t.Fatalf("background check did not cache the release: %q", data)
+	}
+
+	// The next one says so, and how to update, once.
+	c = e.attachTerm(24, 80, "ps")
+	c.waitExit()
+	if !c.contains("moor 9.9.9 is available (you have 0.1.0)") || !c.contains("moor update") {
+		t.Fatalf("no notice:\n%q", c.output.String())
+	}
+	c = e.attachTerm(24, 80, "ps")
+	c.waitExit()
+	if c.contains("available") {
+		t.Fatal("notice repeated within a day")
+	}
+}
+
+// After a session the user is asked; yes runs the install script next to the
+// running binary, no is remembered, and "moor update" needs no question.
+func TestUpdateOffer(t *testing.T) {
+	e, marker := updateEnv(t)
+	prime := func() {
+		os.MkdirAll(filepath.Dir(e.cacheFile()), 0o700)
+		fresh := time.Now().Format(time.RFC3339)
+		os.WriteFile(e.cacheFile(), []byte(`{"checked":"`+fresh+`","latest":"9.9.9"}`), 0o600)
+	}
+	e.mustRun("-n", "w", "run")
+	detach := func(c *termClient) {
+		c.expect("dsh$ ")
+		c.send("\x1c\x1c")
+		c.expect("[moor: detached")
+	}
+
+	// No: nothing runs, and it is not asked again for this release.
+	prime()
+	c := e.attachTerm(24, 80, "attach", "w")
+	detach(c)
+	c.expect("moor 9.9.9 is available (you have 0.1.0).")
+	c.expect("Update now? [y/N]")
+	c.send("n\r")
+	c.expect("moor update")
+	c.waitExit()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the install script ran after answering no")
+	}
+	if data, _ := os.ReadFile(e.cacheFile()); !strings.Contains(string(data), `"declined":"9.9.9"`) {
+		t.Fatalf("decline not remembered: %s", data)
+	}
+	c = e.attachTerm(24, 80, "attach", "w")
+	detach(c)
+	c.waitExit()
+	if c.contains("available") {
+		t.Fatal("asked again about a declined release")
+	}
+
+	// Yes: the script runs, told to install where this binary lives.
+	prime()
+	c = e.attachTerm(24, 80, "attach", "w")
+	detach(c)
+	c.expect("Update now? [y/N]")
+	c.send("y\r")
+	c.expect("script-ran dir=" + filepath.Dir(binary))
+	c.waitExit()
+
+	// "moor update" goes straight to it.
+	os.Remove(marker)
+	if out := e.mustRun("update"); !strings.Contains(out, "script-ran dir=") {
+		t.Fatalf("moor update output %q", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("moor update did not run the script")
+	}
+}
+
 func TestStartInjectsCommandAndKeepsShell(t *testing.T) {
 	e := newEnv(t)
 	c := e.attachTerm(24, 80, "start", "sh", "-c", "echo injected-$((40+2))")
@@ -784,15 +936,52 @@ func TestAttachWithoutArgument(t *testing.T) {
 	if out, err := e.run("attach"); err == nil || !strings.Contains(out, "no sessions") {
 		t.Fatalf("attach with no sessions: %v, %q", err, out)
 	}
-	e.mustRun("-n", "only", "run")
-	c := e.attachTerm(24, 80, "attach")
-	c.expect("dsh$ ")
-	c.detach()
+	attachedTo := func(args ...string) string {
+		c := e.attachTerm(24, 80, args...)
+		c.expect("dsh$ ")
+		var attached string
+		for _, l := range strings.Split(e.ps(), "\n")[1:] {
+			if f := strings.Fields(l); len(f) > 2 && strings.HasPrefix(f[2], "attached") {
+				attached = f[0]
+			}
+		}
+		c.detach()
+		return attached
+	}
 
-	e.mustRun("run")
-	out, err := e.run("attach")
-	if err == nil || !strings.Contains(out, "several sessions") || !strings.Contains(out, "only") {
-		t.Fatalf("attach with two sessions: %v, %q", err, out)
+	e.mustRun("-n", "only", "run")
+	for _, args := range [][]string{{"attach"}, {"a"}, {"-a"}, {"-a", "-r"}, {"-a", "-r", "only"}, {"-r", "-a", "only"}, {"-a", "only", "-r"}} {
+		if got := attachedTo(args...); got != "0" {
+			t.Fatalf("moor %v with one session attached to %q", args, got)
+		}
+	}
+
+	// With several, session 0 is the default; an explicit target overrides it.
+	e.mustRun("-n", "second", "run")
+	e.mustRun("-n", "third", "run")
+	for args, want := range map[string]string{"attach": "0", "-a": "0"} {
+		if got := attachedTo(args); got != want {
+			t.Fatalf("moor %s with three sessions attached to %q, want %s", args, got, want)
+		}
+	}
+	if got := attachedTo("attach", "third"); got != "2" {
+		t.Fatalf("moor attach third attached to %q", got)
+	}
+	if got := attachedTo("-a", "1"); got != "1" {
+		t.Fatalf("moor -a 1 attached to %q", got)
+	}
+
+	// Inside a session, the default skips that session itself.
+	e.setVar("MOOR_SESSION", "0")
+	if got := attachedTo("attach"); got != "1" {
+		t.Fatalf("moor attach inside session 0 attached to %q, want 1", got)
+	}
+	e.setVar("MOOR_SESSION", "")
+
+	// Without session 0, the lowest remaining ID.
+	e.mustRun("kill", "0")
+	if got := attachedTo("attach"); got != "1" {
+		t.Fatalf("moor attach without session 0 attached to %q, want 1", got)
 	}
 }
 
@@ -838,6 +1027,17 @@ func TestCurrentDirectorySession(t *testing.T) {
 	}
 	if out, err := e.run("-n", "x", "."); err == nil {
 		t.Fatalf("-n with an existing session accepted: %q", out)
+	}
+}
+
+func TestPsWithUnreadableMetadata(t *testing.T) {
+	e := newEnv(t)
+	e.mustRun("run")
+	if err := os.WriteFile(filepath.Join(e.root, "moor", "0", "session.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if l := psLine(e.ps(), 0); l != "0 ? detached - - -" {
+		t.Fatalf("ps line %q", l)
 	}
 }
 
@@ -972,6 +1172,44 @@ func TestPromptMarker(t *testing.T) {
 			if hist, _ := os.ReadFile(filepath.Join(e.root, "hist")); !strings.Contains(string(hist), "echo $USER_RC") {
 				t.Fatalf("history not saved: %q", hist)
 			}
+		})
+	}
+}
+
+// A session started from an activated virtualenv gets the same environment,
+// even when the user's startup files put other directories ahead of it.
+func TestSessionInheritsActivatedVirtualenv(t *testing.T) {
+	for _, tc := range []struct{ shell, prompt string }{
+		{"/bin/bash", "1"}, {"/bin/zsh", "1"}, {"/bin/bash", "0"}, {"/bin/zsh", "0"}, // MOOR_PROMPT
+	} {
+		shell := tc.shell
+		t.Run(filepath.Base(shell)+"-prompt"+tc.prompt, func(t *testing.T) {
+			if _, err := os.Stat(shell); err != nil {
+				t.Skip(shell + " not installed")
+			}
+			e := newEnv(t)
+			e.setVar("SHELL", shell)
+			e.setVar("MOOR_PROMPT", tc.prompt)
+			venv := filepath.Join(e.root, "venv")
+			shadow := filepath.Join(e.root, "shadow")
+			for dir, out := range map[string]string{filepath.Join(venv, "bin"): "from-venv", shadow: "from-shadow"} {
+				os.MkdirAll(dir, 0o755)
+				os.WriteFile(filepath.Join(dir, "mytool"), []byte("#!/bin/sh\necho "+out+"\n"), 0o755)
+			}
+			os.WriteFile(filepath.Join(venv, "bin", "activate"), []byte(
+				"deactivate() { unset VIRTUAL_ENV; }\nVIRTUAL_ENV="+venv+"\nexport VIRTUAL_ENV\nPATH=\"$VIRTUAL_ENV/bin:$PATH\"\nexport PATH\n"), 0o644)
+			// moor is started from a shell where the venv is active.
+			e.setVar("VIRTUAL_ENV", venv)
+			e.setVar("PATH", filepath.Join(venv, "bin")+":"+os.Getenv("PATH"))
+			rc := "export PATH=\"" + shadow + ":$PATH\"\nPS1='dsh$ '\nPROMPT='dsh$ '\n"
+			for _, f := range []string{".bashrc", ".zshrc"} {
+				os.WriteFile(filepath.Join(e.root, f), []byte(rc), 0o600)
+			}
+
+			c := e.attachTerm(24, 80, "-n", "py")
+			c.expect("dsh$ ")
+			c.send("echo \"[$(mytool)] [$(command -v deactivate)] [$VIRTUAL_ENV]\"\r")
+			c.expect("[from-venv] [deactivate] [" + venv + "]")
 		})
 	}
 }

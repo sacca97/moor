@@ -470,7 +470,7 @@ func (s *server) finishReplay(c *client) error {
 		c.backlog, c.backlogBytes = nil, 0
 		s.mu.Unlock()
 
-		c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		c.conn.SetWriteDeadline(time.Now().Add(s.timeoutFor(c)))
 		for _, f := range queued {
 			if err := protocol.WriteFrame(c.conn, f.typ, f.payload); err != nil {
 				return err

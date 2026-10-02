@@ -7,7 +7,7 @@ BINDIR ?= $(PREFIX)/bin
 .PHONY: build install uninstall test dist release hooks clean
 
 build:
-	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/moor
+	go build -trimpath -ldflags "-s -w $(LDFLAGS)" -o $(BIN) ./cmd/moor
 
 install: build
 	install -d $(DESTDIR)$(BINDIR)
