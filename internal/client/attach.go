@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"github.com/sacca/moor/internal/protocol"
@@ -67,6 +68,9 @@ const clearScreen = "\x1b[H\x1b[2J\x1b[3J"
 // version closes the connection on a hello it cannot parse; the hello is then
 // sent once more in the older format.
 func handshake(sock string, hello protocol.Hello) (conn net.Conn, typ byte, payload []byte, legacy bool, err error) {
+	// The socket's identity: a retry must reach the same server that hung up,
+	// not whatever took over the path since.
+	before, _ := os.Stat(sock)
 	for {
 		conn, err = net.DialTimeout("unix", sock, 2*time.Second)
 		if err != nil {
@@ -92,6 +96,9 @@ func handshake(sock string, hello protocol.Hello) (conn net.Conn, typ byte, payl
 		}
 		if legacy {
 			return nil, 0, nil, false, errors.New("the session server does not understand this moor version; end the session with 'moor kill' and start a new one")
+		}
+		if now, statErr := os.Stat(sock); before == nil || statErr != nil || !os.SameFile(before, now) {
+			return nil, 0, nil, false, errors.New("the session ended while attaching")
 		}
 		legacy = true
 	}
@@ -134,12 +141,21 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(sigs)
 
+	// Waking the input reader through this pipe is how Attach stops it
+	// without leaving a goroutine blocked on stdin.
+	quitR, quitW, err := os.Pipe()
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer quitR.Close()
+	defer quitW.Close()
+
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return Outcome{}, err
 	}
 	modes := &modeTracker{}
-	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4), legacy: legacy}
+	a := &attachment{conn: conn, out: out, modes: modes, done: make(chan Outcome, 4), legacy: legacy, quit: quitR}
 	restore := sync.OnceFunc(func() {
 		a.setRole(protocol.RoleWriter) // pops the read-only title
 		// Once the terminal is restored, nothing else may be written to it.
@@ -204,7 +220,7 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	}
 	if hello.ReplayLen > 0 {
 		a.drain.start()
-		out.Write(drainQuery)
+		a.emit(drainQuery)
 	}
 
 	stop := make(chan struct{})
@@ -219,9 +235,18 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	}
 
 	go a.readServer()
-	go a.readInput(in)
+	inputDone := make(chan struct{})
+	go func() {
+		defer close(inputDone)
+		a.readInput(in)
+	}()
 
 	o := <-a.done
+	// Whatever ended the attachment, the input reader must be gone before
+	// returning: left on stdin, it would swallow the next thing the user
+	// types, such as the answer to the update prompt.
+	quitW.Write([]byte{0})
+	<-inputDone
 	if o.Result == Detached {
 		a.send(protocol.MsgDetach, nil)
 	}
@@ -237,6 +262,9 @@ type attachment struct {
 	// legacy is set when the session server predates pixel sizes and needs
 	// the older, shorter size messages.
 	legacy bool
+
+	// quit becomes readable when the input reader must stop.
+	quit *os.File
 
 	// restore puts the terminal back; see recoverRestore.
 	restore func()
@@ -362,7 +390,24 @@ func (a *attachment) readServer() {
 func (a *attachment) readInput(in *os.File) {
 	defer a.recoverRestore()
 	buf := make([]byte, 4096)
+	fds := []unix.PollFd{
+		{Fd: int32(in.Fd()), Events: unix.POLLIN},
+		{Fd: int32(a.quit.Fd()), Events: unix.POLLIN},
+	}
 	for {
+		if _, err := unix.Poll(fds, -1); err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			a.finish(Outcome{Result: Lost})
+			return
+		}
+		if fds[1].Revents != 0 {
+			return
+		}
+		if fds[0].Revents == 0 {
+			continue
+		}
 		n, err := in.Read(buf)
 		if n > 0 && a.handleInput(buf[:n]) {
 			a.finish(Outcome{Result: Detached})
@@ -390,13 +435,13 @@ func (a *attachment) handleInput(p []byte) bool {
 	return detach
 }
 
-// armTimer releases a held-back Ctrl-\ after detachTimeout, unless the
+// armTimer releases held-back input after the filter's timeout, unless the
 // filter has moved on to a newer pending state by then. Caller holds a.mu.
 func (a *attachment) armTimer(epoch int) {
 	if a.timer != nil {
 		a.timer.Stop()
 	}
-	a.timer = time.AfterFunc(detachTimeout, func() {
+	a.timer = time.AfterFunc(a.filter.timeout(), func() {
 		defer a.recoverRestore()
 		a.mu.Lock()
 		var fwd []byte
@@ -422,14 +467,12 @@ var (
 	altOff = [][]byte{[]byte("\x1b[?1049l"), []byte("\x1b[?1047l"), []byte("\x1b[?47l")}
 )
 
-func (m *modeTracker) observe(p []byte) {
-	// Fast path: no ESC in the chunk or the kept tail means no sequence can
-	// start or finish here. This covers most output, including big replays.
-	if bytes.IndexByte(p, esc) < 0 && bytes.IndexByte(m.tail, esc) < 0 {
-		return
-	}
-	data := append(m.tail, p...)
-	last, on := -1, false
+// maxAltSeq is the length of the longest alternate-screen sequence.
+const maxAltSeq = 8
+
+// lastAlt finds the last alternate-screen switch in data, if any.
+func lastAlt(data []byte) (on, found bool) {
+	last := -1
 	for _, seq := range altOn {
 		if i := bytes.LastIndex(data, seq); i > last {
 			last, on = i, true
@@ -440,9 +483,34 @@ func (m *modeTracker) observe(p []byte) {
 			last, on = i, false
 		}
 	}
-	if last >= 0 {
+	return on, last >= 0
+}
+
+func (m *modeTracker) observe(p []byte) {
+	// Fast path: no ESC in the chunk or the kept tail means no sequence can
+	// start or finish here. This covers most output, including big replays.
+	if bytes.IndexByte(p, esc) < 0 && bytes.IndexByte(m.tail, esc) < 0 {
+		return
+	}
+	// A sequence split across chunks lies in the tail plus the start of p;
+	// anything wholly inside p is found by searching p itself, and is later
+	// than any match that began in the tail, so it wins.
+	if len(m.tail) > 0 {
+		head := append(m.tail[:len(m.tail):len(m.tail)], p[:min(len(p), maxAltSeq-1)]...)
+		if on, ok := lastAlt(head); ok {
+			m.altScreen = on
+		}
+	}
+	if on, ok := lastAlt(p); ok {
 		m.altScreen = on
 	}
-	keep := min(len(data), 7)
-	m.tail = append(m.tail[:0:0], data[len(data)-keep:]...)
+	const keep = maxAltSeq - 1
+	if len(p) >= keep {
+		m.tail = append(m.tail[:0], p[len(p)-keep:]...)
+	} else {
+		m.tail = append(m.tail, p...)
+		if len(m.tail) > keep {
+			m.tail = append(m.tail[:0], m.tail[len(m.tail)-keep:]...)
+		}
+	}
 }

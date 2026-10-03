@@ -20,7 +20,7 @@ type Meta struct {
 	CreatedAt time.Time `json:"created_at"`
 	CWD       string    `json:"cwd"`
 	Command   string    `json:"command,omitempty"`
-	Clients   int       `json:"clients"` // attached clients
+	Clients   int       `json:"-"` // attached clients; filled in from a live probe when listing, never stored
 }
 
 const (

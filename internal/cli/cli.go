@@ -26,9 +26,9 @@ const usage = `moor - moor a shell so it stays alive, then attach and detach at 
 
 Usage:
   moor [-n NAME]                 start a shell and attach to it
-  moor [-n NAME] start [--] COMMAND [ARGS...]
+  moor [-n NAME] start [--] [COMMAND [ARGS...]]
                                  start a shell, run COMMAND in it, attach
-  moor [-n NAME] run [--] COMMAND [ARGS...]
+  moor [-n NAME] run [--] [COMMAND [ARGS...]]
                                  same as start, but stay detached
   moor [-r] [-n NAME] . | cwd    attach to the session started in this directory,
                                  or create one named after it
@@ -68,7 +68,8 @@ func Main(args []string) int {
 		}
 		return 0
 	}
-	err := run(args)
+	inv := &invocation{}
+	err := inv.run(args)
 	code := 0
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "moor: %v\n", err)
@@ -80,9 +81,9 @@ func Main(args []string) int {
 		}
 	}
 	// After the command, so the question is not wiped by an attach.
-	if err == nil && !isInfoCommand(args) && !isUpdate(args) {
+	if err == nil && !inv.noUpdateCheck {
 		if latest := update.Check(Version); latest != "" {
-			if attached {
+			if inv.attached {
 				update.Offer(latest, Version)
 			} else {
 				fmt.Fprintf(os.Stderr, "moor %s is available (you have %s). Update with: moor update\n", latest, Version)
@@ -92,23 +93,17 @@ func Main(args []string) int {
 	return code
 }
 
-// attached is set once the user has been attached to a session, which makes
-// a good moment to offer an update.
-var attached bool
-
-func isUpdate(args []string) bool { return len(args) > 0 && args[0] == "update" }
-
-// isInfoCommand is true for commands that only print help or the version.
-func isInfoCommand(args []string) bool {
-	for _, a := range args {
-		if a == "-h" || a == "--help" || a == "help" || a == "--version" || a == "version" {
-			return true
-		}
-	}
-	return false
+// invocation is the state of one call to Main.
+type invocation struct {
+	// attached is set once the user has been attached to a session, which
+	// makes a good moment to offer an update.
+	attached bool
+	// noUpdateCheck is set by commands that only print help or the version,
+	// or that update themselves.
+	noUpdateCheck bool
 }
 
-func run(args []string) error {
+func (inv *invocation) run(args []string) error {
 	var name, attach string
 	var nameSet, attachSet, readOnly bool
 
@@ -117,9 +112,11 @@ func run(args []string) error {
 		a := args[i]
 		switch {
 		case a == "-h" || a == "--help":
+			inv.noUpdateCheck = true
 			fmt.Print(usage)
 			return nil
 		case a == "--version":
+			inv.noUpdateCheck = true
 			fmt.Println("moor", Version)
 			return nil
 		case a == "-n" || a == "--name":
@@ -167,15 +164,15 @@ parsed:
 			return usageError("-a takes no other arguments except -r")
 		}
 		if attach == "" {
-			return cmdAttachDefault(readOnly)
+			return inv.cmdAttachDefault(readOnly)
 		}
-		return cmdAttach(attach, readOnly)
+		return inv.cmdAttach(attach, readOnly)
 	}
 	if readOnly && (len(rest) == 0 || (rest[0] != "attach" && rest[0] != "a" && rest[0] != "." && rest[0] != "cwd")) {
 		return usageError("-r only applies to attach")
 	}
 	if len(rest) == 0 {
-		return cmdNew(name, "", true)
+		return inv.cmdNew(name, "", true)
 	}
 
 	switch rest[0] {
@@ -193,12 +190,12 @@ parsed:
 			}
 			name = startName
 		}
-		return cmdNew(name, joinCommand(cmdArgs), rest[0] == "start")
+		return inv.cmdNew(name, joinCommand(cmdArgs), rest[0] == "start")
 	case ".", "cwd":
 		if len(rest) != 1 {
 			return usageError("usage: moor [-r] [-n NAME] .")
 		}
-		return cmdHere(name, nameSet, readOnly)
+		return inv.cmdHere(name, nameSet, readOnly)
 	case "attach", "a":
 		targets := rest[1:]
 		if len(targets) > 0 && (targets[0] == "-r" || targets[0] == "--read-only") {
@@ -208,9 +205,9 @@ parsed:
 			return usageError("usage: moor attach [-r] [ID|NAME]")
 		}
 		if len(targets) == 0 {
-			return cmdAttachDefault(readOnly)
+			return inv.cmdAttachDefault(readOnly)
 		}
-		return cmdAttach(targets[0], readOnly)
+		return inv.cmdAttach(targets[0], readOnly)
 	case "ps", "ls", "list":
 		if nameSet || len(rest) != 1 {
 			return usageError("usage: moor ps")
@@ -230,25 +227,28 @@ parsed:
 		if nameSet || len(rest) != 1 {
 			return usageError("usage: moor update")
 		}
+		inv.noUpdateCheck = true
 		return update.Install()
 	case "version":
+		inv.noUpdateCheck = true
 		fmt.Println("moor", Version)
 		return nil
 	case "help":
+		inv.noUpdateCheck = true
 		fmt.Print(usage)
 		return nil
 	}
 	return usageError(fmt.Sprintf("unknown command %q (to run a program, use: moor start %s)", rest[0], rest[0]))
 }
 
-func cmdNew(name, command string, attach bool) error {
-	return newSession(session.CreateOptions{Name: name, Command: command}, attach)
+func (inv *invocation) cmdNew(name, command string, attach bool) error {
+	return inv.newSession(session.CreateOptions{Name: name, Command: command}, attach)
 }
 
 // cmdHere attaches to the session started in the current directory. Several
 // are listed for the user to choose from; none means a new one is created,
 // named after the directory.
-func cmdHere(name string, nameSet, readOnly bool) error {
+func (inv *invocation) cmdHere(name string, nameSet, readOnly bool) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -268,12 +268,12 @@ func cmdHere(name string, nameSet, readOnly bool) error {
 		if readOnly {
 			return fmt.Errorf("no session started in %s to watch", cwd)
 		}
-		return newSession(session.CreateOptions{Name: name, DefaultName: session.DirName(cwd)}, true)
+		return inv.newSession(session.CreateOptions{Name: name, DefaultName: session.DirName(cwd)}, true)
 	case 1:
 		if nameSet {
 			return fmt.Errorf("a session already exists for %s (%s); -n only applies when creating one", cwd, sessionLabel(here[0].ID, here[0].Name))
 		}
-		return attachTo(here[0].ID, here[0].Name, readOnly)
+		return inv.attachTo(here[0].ID, here[0].Name, readOnly)
 	}
 	printSessions(os.Stderr, here)
 	return fmt.Errorf("several sessions started in %s; say which one: moor attach ID|NAME", cwd)
@@ -290,7 +290,7 @@ func sameDir(a, b string) bool {
 	return errA == nil && errB == nil && ra == rb
 }
 
-func newSession(opts session.CreateOptions, attach bool) error {
+func (inv *invocation) newSession(opts session.CreateOptions, attach bool) error {
 	fd := int(os.Stdin.Fd())
 	if attach && !term.IsTerminal(fd) {
 		return errors.New("stdin is not a terminal (use 'moor run' to start a detached session)")
@@ -305,21 +305,24 @@ func newSession(opts session.CreateOptions, attach bool) error {
 		fmt.Printf("started %s\n", sessionLabel(m.ID, m.Name))
 		return nil
 	}
-	return attachTo(m.ID, m.Name, false)
+	return inv.attachTo(m.ID, m.Name, false)
 }
 
-func cmdAttach(target string, readOnly bool) error {
+func (inv *invocation) cmdAttach(target string, readOnly bool) error {
+	if target == "." { // as in "moor ."; no session can be named "."
+		return inv.cmdHere("", false, readOnly)
+	}
 	s, err := session.Resolve(target)
 	if err != nil {
 		return err
 	}
-	return attachTo(s.ID, s.Name, readOnly)
+	return inv.attachTo(s.ID, s.Name, readOnly)
 }
 
 // cmdAttachDefault attaches without being told which session: the only one,
 // or with several, the lowest ID (session 0 unless it is gone). Inside a
 // session, that session itself is skipped when there are others.
-func cmdAttachDefault(readOnly bool) error {
+func (inv *invocation) cmdAttachDefault(readOnly bool) error {
 	sessions, err := session.List()
 	if err != nil {
 		return err
@@ -331,7 +334,7 @@ func cmdAttachDefault(readOnly bool) error {
 	if cur := os.Getenv("MOOR_SESSION"); len(sessions) > 1 && cur == strconv.Itoa(s.ID) {
 		s = sessions[1]
 	}
-	return attachTo(s.ID, s.Name, readOnly)
+	return inv.attachTo(s.ID, s.Name, readOnly)
 }
 
 func cmdRename(target, newName string) error {
@@ -346,8 +349,7 @@ func cmdRename(target, newName string) error {
 	return nil
 }
 
-func attachTo(id int, name string, readOnly bool) error {
-	attached = true
+func (inv *invocation) attachTo(id int, name string, readOnly bool) error {
 	if os.Getenv("MOOR_SESSION") == strconv.Itoa(id) {
 		return fmt.Errorf("cannot attach session %d from inside itself", id)
 	}
@@ -355,6 +357,7 @@ func attachTo(id int, name string, readOnly bool) error {
 	if err != nil {
 		return err
 	}
+	inv.attached = true
 	label := sessionLabel(id, name)
 	switch o.Result {
 	case client.Detached:

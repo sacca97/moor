@@ -87,3 +87,14 @@ func TestRemoveChecksOwner(t *testing.T) {
 		t.Fatal("Remove did not delete its own directory")
 	}
 }
+
+func TestLowestFree(t *testing.T) {
+	for _, c := range []struct {
+		used []int
+		want int
+	}{{nil, 0}, {[]int{1, 2}, 0}, {[]int{0, 1, 3}, 2}, {[]int{0, 1, 2}, 3}, {[]int{0, 0, 1}, 2}} {
+		if got := LowestFree(c.used); got != c.want {
+			t.Errorf("LowestFree(%v) = %d, want %d", c.used, got, c.want)
+		}
+	}
+}

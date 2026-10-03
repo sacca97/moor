@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,8 +23,9 @@ const probeTimeout = time.Second
 var (
 	// ErrStale means nothing is listening on the session's socket.
 	ErrStale = errors.New("session server is not running")
-	// ErrUnresponsive means the socket accepted a connection but the server
-	// did not answer in time. Such sessions are hidden but not removed.
+	// ErrUnresponsive means the server could not be reached or did not answer
+	// (a timeout, no file descriptors, ...). Such sessions are hidden but
+	// never removed: the failure says nothing about the server being dead.
 	ErrUnresponsive = errors.New("session server is not responding")
 )
 
@@ -94,12 +96,27 @@ func Lock() (func(), error) {
 	}, nil
 }
 
+// dialSession connects to session id's socket. Only a socket that is
+// definitely gone (missing, or nothing accepting on it) is ErrStale; any other
+// failure is ErrUnresponsive, so a live session is never mistaken for a dead
+// one and cleaned up.
+func dialSession(id int) (net.Conn, error) {
+	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
+	if err == nil {
+		return conn, nil
+	}
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOTSOCK) {
+		return nil, ErrStale
+	}
+	return nil, ErrUnresponsive
+}
+
 // Probe asks the session server whether it is alive and how many clients are
 // attached.
 func Probe(id int) (clients int, err error) {
-	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
+	conn, err := dialSession(id)
 	if err != nil {
-		return 0, ErrStale
+		return 0, err
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(probeTimeout))
@@ -112,9 +129,12 @@ func Probe(id int) (clients int, err error) {
 		if errors.As(err, &ne) && ne.Timeout() {
 			return 0, ErrUnresponsive
 		}
-		// The server closed the connection without answering: it is
-		// shutting down.
-		return 0, ErrStale
+		if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+			// The server closed the connection without answering: it is
+			// shutting down.
+			return 0, ErrStale
+		}
+		return 0, ErrUnresponsive
 	}
 	if typ != protocol.MsgPong || len(payload) != 1 {
 		return 0, ErrUnresponsive
@@ -126,11 +146,12 @@ func Probe(id int) (clients int, err error) {
 // goes through the session's own socket rather than a signal to a pid, so it
 // can only ever reach that session's server.
 func Kill(id int) error {
-	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
+	conn, err := dialSession(id)
 	if err != nil {
-		return ErrStale
+		return err
 	}
 	defer conn.Close()
+	// The server sends no reply; callers watch for the session to go away.
 	conn.SetWriteDeadline(time.Now().Add(probeTimeout))
 	return protocol.WriteFrame(conn, protocol.MsgKill, nil)
 }
@@ -155,9 +176,9 @@ func Rename(id int, name string) error {
 			return fmt.Errorf("session name %q is already in use", name)
 		}
 	}
-	conn, err := net.DialTimeout("unix", SocketPath(id), probeTimeout)
+	conn, err := dialSession(id)
 	if err != nil {
-		return ErrStale
+		return err
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(2 * probeTimeout))

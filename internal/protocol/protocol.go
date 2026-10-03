@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 )
 
 const (
@@ -45,17 +46,17 @@ const headerSize = 5
 
 var ErrFrameTooLarge = errors.New("protocol: frame too large")
 
-// WriteFrame writes one frame with a single Write call, so concurrent writers
-// that serialize on a mutex never interleave partial frames.
+// WriteFrame writes one frame without copying the payload. On a net.Conn the
+// header and payload go out in one writev, which holds the connection's write
+// lock throughout, so frames from concurrent writers never interleave.
 func WriteFrame(w io.Writer, typ byte, payload []byte) error {
 	if len(payload) > MaxPayload {
 		return ErrFrameTooLarge
 	}
-	buf := make([]byte, headerSize+len(payload))
-	buf[0] = typ
-	binary.BigEndian.PutUint32(buf[1:headerSize], uint32(len(payload)))
-	copy(buf[headerSize:], payload)
-	_, err := w.Write(buf)
+	hdr := make([]byte, headerSize)
+	hdr[0] = typ
+	binary.BigEndian.PutUint32(hdr[1:], uint32(len(payload)))
+	_, err := (&net.Buffers{hdr, payload}).WriteTo(w)
 	return err
 }
 

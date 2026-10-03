@@ -22,10 +22,19 @@ func TestDetachFilter(t *testing.T) {
 		"double press":       {{in: bs + bs, detach: true}},
 		"split double press": {{in: "ab", out: "ab"}, {in: bs}, {in: bs, detach: true}},
 		"input before it":    {{in: "ls\r" + bs + bs + "junk", out: "ls\r", detach: true}},
-		"escape is instant": {
-			{in: "\x1b", out: "\x1b"}, {in: "\x1b\x1b", out: "\x1b\x1b"}, {in: "\x1b[A", out: "\x1b[A"},
+		"escape sequences": {
+			{in: "\x1b[A", out: "\x1b[A"},
 			{in: "\x1bOB", out: "\x1bOB"}, {in: "\x1bx", out: "\x1bx"},
 			{in: "\x1b[27u\x1b[27u", out: "\x1b[27u\x1b[27u"}, // kitty Esc
+			{in: "\x1b\x1b", out: "\x1b"},                     // the second Esc is held
+			{in: "x", out: "\x1bx"},
+		},
+		"split paste start": {
+			{in: "\x1b[20"}, {in: "0~a" + bs, out: "\x1b[200~a" + bs}, {in: bs, out: bs},
+			{in: "\x1b[201~", out: "\x1b[201~"}, {in: bs + bs, detach: true},
+		},
+		"split paste end": {
+			{in: "\x1b[200~\x1b[20", out: "\x1b[200~"}, {in: "1~", out: "\x1b[201~"}, {in: bs + bs, detach: true},
 		},
 		"single press then key":  {{in: bs}, {in: "x", out: bs + "x"}, {in: bs}, {in: "\x1b[A", out: bs + "\x1b[A"}},
 		"split kitty sequence":   {{in: "\x1b[92;5u"}, {in: "\x1b[92"}, {in: ";5u", detach: true}},
@@ -104,6 +113,55 @@ func TestPrefixHasNoTimeout(t *testing.T) {
 	}
 	if got := string(f.flush()); got != "\x02\x1b[" {
 		t.Fatalf("flush = %q", got)
+	}
+}
+
+// A lone Esc is held briefly in case it starts a paste marker, then released.
+func TestLoneEscapeIsFlushed(t *testing.T) {
+	f := &detachFilter{}
+	if out, _ := f.feed([]byte("\x1b")); len(out) != 0 || !f.timed() || f.timeout() != escTimeout {
+		t.Fatalf("lone Esc: out %q, timed %v", out, f.timed())
+	}
+	if got := string(f.flush()); got != "\x1b" {
+		t.Fatalf("flush = %q", got)
+	}
+}
+
+// A partial paste-end marker inside a paste is never timed out, so the paste
+// always ends and the detach keys work afterwards.
+func TestPartialMarkerInPasteIsNotTimed(t *testing.T) {
+	f := &detachFilter{}
+	f.feed([]byte("\x1b[200~a"))
+	f.feed([]byte("\x1b[20"))
+	if f.timed() {
+		t.Fatal("a partial marker inside a paste must not be timed")
+	}
+	if out, _ := f.feed([]byte("1~")); string(out) != "\x1b[201~" || f.inPaste {
+		t.Fatalf("paste end: out %q, inPaste %v", out, f.inPaste)
+	}
+	if _, detach := f.feed([]byte(bs + bs)); !detach {
+		t.Fatal("detach keys must work after the paste")
+	}
+}
+
+func TestModeTrackerSplits(t *testing.T) {
+	stream := "abc\x1b[?1049hdef\x1b[?47lghi\x1b[?1047h"
+	for cut := 0; cut <= len(stream); cut++ {
+		for cut2 := cut; cut2 <= len(stream); cut2++ {
+			m := &modeTracker{}
+			m.observe([]byte(stream[:cut]))
+			m.observe([]byte(stream[cut:cut2]))
+			m.observe([]byte(stream[cut2:]))
+			if !m.altScreen {
+				t.Fatalf("cuts %d,%d: alternate screen not tracked", cut, cut2)
+			}
+		}
+	}
+	m := &modeTracker{}
+	m.observe([]byte("\x1b[?1049h\x1b[?10"))
+	m.observe([]byte("49lx"))
+	if m.altScreen {
+		t.Fatal("split leave sequence missed")
 	}
 }
 

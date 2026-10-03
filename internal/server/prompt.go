@@ -11,8 +11,9 @@ import (
 
 // The prompt marker is a dim "[moor:name] " (or "[moor] " for an unnamed
 // session) prefixed to the shell's prompt, so a shell inside moor is
-// recognizable at a glance. It is added by wrapping the shell's startup files: the user's own configuration is loaded unchanged
-// first, then a prompt hook re-adds the marker before every prompt (so themes
+// recognizable at a glance. It is added by wrapping the shell's startup
+// files: the user's own configuration is loaded unchanged first, then a prompt
+// hook re-adds the marker before every prompt (so themes
 // that rebuild the prompt each time keep it). Set MOOR_PROMPT=0 to disable.
 //
 // Supported shells are zsh, bash and fish; others start unmodified and can

@@ -19,6 +19,10 @@ const (
 // If it expires, the Ctrl-\ is forwarded to the session.
 const detachTimeout = 400 * time.Millisecond
 
+// escTimeout is how long an incomplete escape sequence that may be part of a
+// paste marker is held back.
+const escTimeout = 30 * time.Millisecond
+
 var (
 	pasteStart = []byte("\x1b[200~")
 	pasteEnd   = []byte("\x1b[201~")
@@ -32,7 +36,10 @@ var (
 // prefix, the filter waits for the next key with no timeout; Ctrl-b Ctrl-b
 // sends a single literal Ctrl-b, and any other key is forwarded after the
 // Ctrl-b. A lone Ctrl-\ is released after a timeout, or by the next key.
-// All other input, Esc included, passes through without delay.
+// All other input passes through without delay, except that an incomplete
+// escape sequence at the end of a read is held for escTimeout when it could be
+// the start of a bracketed-paste marker, so a marker split across reads is
+// still recognized; a lone Esc is released when the timeout expires.
 //
 // Besides the raw bytes, the keys are recognized in the encodings terminals
 // use when a program enables extended keyboard reporting: the kitty keyboard
@@ -94,21 +101,23 @@ func (f *detachFilter) feed(p []byte) (out []byte, detach bool) {
 			}
 			tok = f.seq
 		}
+		// tok may alias f.seq's backing array, which is reused for the next
+		// sequence, so copy it before resetting.
 		tok = bytes.Clone(tok)
 		f.seq = f.seq[:0]
 		if out, detach = f.emit(out, tok); detach {
 			return out, true
 		}
 	}
-	// An incomplete sequence at the end of a read is almost always a lone
-	// Esc key. Forward it now rather than delaying Esc; only while a press
-	// is held is it kept, in case it begins the second key.
-	if len(f.seq) > 0 && len(f.held) == 0 {
+	// An incomplete sequence at the end of a read is kept if a press is
+	// held (it may begin the second key) or it may be a split paste marker;
+	// otherwise it is forwarded now.
+	if len(f.seq) > 0 && len(f.held) == 0 && !partialMarker(f.seq) {
 		out = append(out, f.seq...)
 		f.seq = f.seq[:0]
 	}
-	if len(f.seq) > 0 && f.prefix {
-		f.epoch++ // the untimed Ctrl-b wait now has a half-key that needs a timeout
+	if len(f.seq) > 0 {
+		f.epoch++ // a half-key is waiting and needs a timeout
 	}
 	return out, false
 }
@@ -153,13 +162,32 @@ func (f *detachFilter) emit(out, tok []byte) ([]byte, bool) {
 	return out, false
 }
 
+// partialMarker reports whether seq is a proper prefix of a paste marker.
+func partialMarker(seq []byte) bool {
+	return bytes.HasPrefix(pasteStart, seq) || bytes.HasPrefix(pasteEnd, seq)
+}
+
+// timeout is how long what is held back may wait before the caller flushes
+// it: escTimeout for a bare partial sequence, detachTimeout once a press is
+// held.
+func (f *detachFilter) timeout() time.Duration {
+	if len(f.held) == 0 {
+		return escTimeout
+	}
+	return detachTimeout
+}
+
 func (f *detachFilter) pending() bool { return len(f.seq) > 0 || len(f.held) > 0 }
 
 // timed reports whether what is held back must be released after
 // detachTimeout. A Ctrl-b waiting for its key is not: it waits indefinitely,
 // unless a partial escape sequence is also pending.
+//
+// Inside a bracketed paste nothing is timed: releasing a partial marker early
+// would make the filter miss the end of the paste, and a lone Esc is not
+// ambiguous there.
 func (f *detachFilter) timed() bool {
-	return f.pending() && (!f.prefix || len(f.seq) > 0)
+	return f.pending() && !f.inPaste && (!f.prefix || len(f.seq) > 0)
 }
 
 // flush releases everything held back. The caller invokes it when

@@ -774,6 +774,17 @@ func TestUpdateOffer(t *testing.T) {
 		t.Fatal("asked again about a declined release")
 	}
 
+	// An attach that is refused is not a session worth interrupting.
+	prime()
+	e.setVar("MOOR_SESSION", "0")
+	c = e.attachTerm(24, 80, "attach", "w")
+	c.expect("cannot attach session 0 from inside itself")
+	c.waitExit()
+	if c.contains("available") {
+		t.Fatal("offered an update after a refused attach")
+	}
+	e.setVar("MOOR_SESSION", "")
+
 	// Yes: the script runs, told to install where this binary lives.
 	prime()
 	c = e.attachTerm(24, 80, "attach", "w")

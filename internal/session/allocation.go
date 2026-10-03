@@ -27,15 +27,17 @@ type CreateOptions struct {
 
 const startTimeout = 10 * time.Second
 
-// LowestFree returns the smallest non-negative integer not in used.
+// LowestFree returns the smallest non-negative integer not in used, which
+// must be sorted ascending (as scanLocked returns it).
 func LowestFree(used []int) int {
-	taken := make(map[int]bool, len(used))
-	for _, id := range used {
-		taken[id] = true
-	}
 	id := 0
-	for taken[id] {
-		id++
+	for _, u := range used {
+		if u > id {
+			break
+		}
+		if u == id {
+			id++
+		}
 	}
 	return id
 }

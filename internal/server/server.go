@@ -22,13 +22,10 @@ import (
 
 const (
 	scrollbackSize = 8 << 20
-	// writeTimeout bounds how long PTY output may block on a stuck client
-	// before the client is dropped; the shell must never stall on it.
-	writeTimeout = 10 * time.Second
-	// watcherTimeout is the same for clients that are not the writer: a
-	// frozen watcher (a suspended terminal, say) is dropped quickly rather
-	// than holding up the session and the writer's output.
-	watcherTimeout   = time.Second
+	// writeTimeout bounds how long a single write to a client may block
+	// before the client is dropped. Each client has its own writer goroutine,
+	// so a stuck one never holds up the shell or the other clients.
+	writeTimeout     = 10 * time.Second
 	handshakeTimeout = 5 * time.Second
 	replayChunk      = 64 << 10
 	// drainTimeout is how long to wait for remaining PTY output after the
@@ -46,12 +43,22 @@ type client struct {
 	writer   atomic.Bool     // announced role; changed under server.mu
 	size     protocol.Resize // last known terminal size; guarded by server.mu
 
-	// While replaying, the client is still being sent the scrollback by its
-	// attach goroutine, outside server.mu. Frames for it are queued in
-	// backlog meanwhile and sent when the replay is done. Guarded by server.mu.
-	replaying    bool
-	backlog      []frame
-	backlogBytes int
+	// Frames for the client are queued and sent by its own writer goroutine
+	// (writeLoop), so a slow client never blocks anyone else. While replaying,
+	// the attach goroutine is still sending the scrollback and the writer has
+	// not started: frames just accumulate. Payloads are shared between
+	// clients and must never be modified. All guarded by server.mu, except
+	// the channels.
+	replaying  bool
+	queue      []frame
+	queueBytes int
+	final      bool     // the last queued frame ends the session
+	inq        [][]byte // input waiting to be written to the PTY
+	inBytes    int
+	inWake     chan struct{} // signals the input goroutine
+	wake       chan struct{} // signals the writer that the queue changed
+	quit       chan struct{} // closed when the client is dropped
+	writerDone chan struct{} // closed when the writer goroutine has returned
 }
 
 type frame struct {
@@ -59,9 +66,19 @@ type frame struct {
 	payload []byte
 }
 
-// maxBacklog bounds what is queued for a client that is slow to take its
-// replay; beyond it the client is dropped.
-const maxBacklog = scrollbackSize
+// maxInput bounds the keyboard input queued for the PTY per client; beyond it
+// input is discarded, which only happens when the shell has stopped reading.
+const maxInput = 8 << 20
+
+// highWater is how much output may be queued for the writer before the shell's
+// output is held back until it catches up, as a slow terminal does to any
+// program, replaying or not. Watchers get no such courtesy: they are dropped
+// at maxQueue.
+const highWater = maxQueue / 4
+
+// maxQueue bounds what is queued for a client that is slow to take its
+// output; beyond it the client is dropped.
+const maxQueue = scrollbackSize
 
 type server struct {
 	id   int
@@ -70,13 +87,17 @@ type server struct {
 	ptmx *os.File
 	cmd  *exec.Cmd
 
-	// mu guards clients, lastWriter, scroll, and writes to clients (except a
-	// replaying client's replay, which is sent without it).
+	// mu guards clients, lastWriter, scroll and the clients' queues. Nothing
+	// is written to a connection while holding it.
 	mu         sync.Mutex
 	clients    []*client // in attach order; the newest non-read-only one writes
 	lastWriter *client
 	scroll     *Ring
 	nclients   atomic.Int32
+	// ptyMu serializes writes to the PTY master, so input from two clients
+	// (around a change of writer) or the startup command never interleaves.
+	ptyMu   sync.Mutex
+	drained *sync.Cond // on mu; broadcast when a queue shrinks or a client leaves
 
 	stop chan struct{} // receives when "moor kill" asks the session to end
 
@@ -124,6 +145,7 @@ func start(id int, rows, cols uint16) (*server, error) {
 		firstOutput: make(chan struct{}),
 		readerDone:  make(chan struct{}),
 	}
+	s.drained = sync.NewCond(&s.mu)
 	meta, err := session.ReadMeta(s.dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading session metadata: %w", err)
@@ -196,20 +218,50 @@ func (s *server) run(term <-chan os.Signal) int {
 		code = st.ExitCode()
 	}
 	s.ln.Close()
-	s.mu.Lock()
-	for _, c := range s.clients {
-		// A whole frame is written atomically, so this is safe even while the
-		// attach goroutine is still sending a replay; the client treats an
-		// exit between replay chunks as the end of the session.
-		c.conn.SetWriteDeadline(time.Now().Add(time.Second))
-		protocol.WriteFrame(c.conn, protocol.MsgExit, protocol.EncodeExit(code))
-		c.conn.Close()
-	}
-	s.clients = nil
-	s.mu.Unlock()
+	s.notifyExit(code)
 	session.Remove(s.id, os.Getpid())
 	s.ptmx.Close()
 	return 0
+}
+
+// notifyExit tells every client that the session ended, and closes them.
+func (s *server) notifyExit(code int) {
+	exit := protocol.EncodeExit(code)
+	var replaying, live []*client
+	s.mu.Lock()
+	clients := s.clients
+	s.clients = nil
+	s.drained.Broadcast()
+	for _, c := range clients {
+		if c.replaying {
+			replaying = append(replaying, c)
+			continue
+		}
+		// Let the writer deliver what is queued, then the exit.
+		c.queue = append(c.queue, frame{protocol.MsgExit, exit})
+		c.final = true
+		c.signal()
+		live = append(live, c)
+	}
+	s.mu.Unlock()
+
+	// A whole frame is written atomically, so this is safe even while a
+	// client's attach goroutine is still sending its replay; the client
+	// treats an exit between replay chunks as the end of the session.
+	for _, c := range replaying {
+		c.conn.SetWriteDeadline(time.Now().Add(time.Second))
+		protocol.WriteFrame(c.conn, protocol.MsgExit, exit)
+		c.conn.Close()
+	}
+	// Give the writers a moment; a client that is not draining is cut off.
+	grace := time.After(time.Second)
+	for _, c := range live {
+		select {
+		case <-c.writerDone:
+		case <-grace:
+		}
+		c.conn.Close()
+	}
 }
 
 // hangup terminates the shell as a terminal hangup would: closing the PTY
@@ -251,11 +303,22 @@ func (s *server) readLoop() {
 			s.lastOutput.Store(time.Now().UnixNano())
 			once.Do(func() { close(s.firstOutput) })
 			s.mu.Lock()
+			// Backpressure from the client in control, so a flood of output
+			// does not overrun a terminal that is merely slow. It ends when
+			// the client catches up, is dropped (a stuck write times out), or
+			// loses control.
+			for w := s.writerLocked(); w != nil && w.queueBytes > highWater; w = s.writerLocked() {
+				s.drained.Wait()
+			}
 			s.scroll.Write(buf[:n])
 			var failed []*client
-			for _, c := range s.clients {
-				if err := s.sendLocked(c, protocol.MsgOutput, buf[:n]); err != nil {
-					failed = append(failed, c)
+			if len(s.clients) > 0 {
+				// One copy, shared by every client's queue.
+				data := bytes.Clone(buf[:n])
+				for _, c := range s.clients {
+					if err := s.sendLocked(c, protocol.MsgOutput, data); err != nil {
+						failed = append(failed, c)
+					}
 				}
 			}
 			for _, c := range failed {
@@ -283,7 +346,7 @@ func (s *server) inject(command string) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	s.ptmx.Write([]byte(command + "\r"))
+	s.writePTY(nil, []byte(command+"\r"))
 }
 
 func (s *server) acceptLoop() {
@@ -357,7 +420,10 @@ func (s *server) attach(conn net.Conn, hello []byte) {
 	if err != nil {
 		return
 	}
-	c := &client{conn: conn, readOnly: h.ReadOnly, size: h.Size}
+	c := &client{
+		conn: conn, readOnly: h.ReadOnly, size: h.Size,
+		wake: make(chan struct{}, 1), inWake: make(chan struct{}, 1), quit: make(chan struct{}), writerDone: make(chan struct{}),
+	}
 	role := protocol.RoleWriter
 	if c.readOnly {
 		role = protocol.RoleReadOnly
@@ -374,7 +440,7 @@ func (s *server) attach(conn net.Conn, hello []byte) {
 	s.nclients.Store(int32(len(s.clients)))
 	s.rolesLocked()
 	s.mu.Unlock()
-	s.syncMeta()
+	go s.inputLoop(c)
 
 	conn.SetWriteDeadline(time.Now().Add(writeTimeout + time.Duration(len(replay)>>20)*time.Second))
 	err = protocol.WriteFrame(conn, protocol.MsgHello,
@@ -402,9 +468,7 @@ loop:
 		}
 		switch typ {
 		case protocol.MsgInput:
-			if c.writer.Load() {
-				s.ptmx.Write(payload)
-			}
+			s.queueInput(c, payload)
 		case protocol.MsgResize:
 			if r, err := protocol.DecodeResize(payload); err == nil {
 				s.mu.Lock()
@@ -429,52 +493,128 @@ loop:
 	s.mu.Unlock()
 }
 
-// timeoutFor is how long a write to c may block before it is dropped.
-func (s *server) timeoutFor(c *client) time.Duration {
-	if c.writer.Load() {
-		return writeTimeout
+// queueInput hands keyboard input to c's input goroutine, so a program that
+// has stopped reading its terminal never blocks the connection (and with it
+// the detach key).
+func (s *server) queueInput(c *client, p []byte) {
+	if !c.writer.Load() {
+		return
 	}
-	return watcherTimeout
-}
-
-// sendLocked writes a frame to c, or queues it if c is still taking its
-// replay. A non-nil error means c should be dropped.
-func (s *server) sendLocked(c *client, typ byte, payload []byte) error {
-	if c.replaying {
-		if c.backlogBytes+len(payload) > maxBacklog {
-			return errors.New("client too slow to take its replay")
+	s.mu.Lock()
+	if c.inBytes+len(p) <= maxInput {
+		c.inq = append(c.inq, p)
+		c.inBytes += len(p)
+		select {
+		case c.inWake <- struct{}{}:
+		default:
 		}
-		c.backlog = append(c.backlog, frame{typ, bytes.Clone(payload)})
-		c.backlogBytes += len(payload)
-		return nil
 	}
-	c.conn.SetWriteDeadline(time.Now().Add(s.timeoutFor(c)))
-	return protocol.WriteFrame(c.conn, typ, payload)
+	s.mu.Unlock()
 }
 
-// finishReplay sends what was queued for c during its replay, then switches
-// it to live delivery.
-func (s *server) finishReplay(c *client) error {
+// inputLoop writes c's queued input to the PTY until c is dropped.
+func (s *server) inputLoop(c *client) {
 	for {
+		quit := false
+		select {
+		case <-c.inWake:
+		case <-c.quit:
+			quit = true // deliver what was typed before the detach
+		}
 		s.mu.Lock()
-		if !slices.Contains(s.clients, c) {
-			s.mu.Unlock()
-			return errors.New("client was dropped")
+		queued := c.inq
+		c.inq, c.inBytes = nil, 0
+		s.mu.Unlock()
+		for _, p := range queued {
+			s.writePTY(c, p)
 		}
-		queued := c.backlog
-		if len(queued) == 0 {
-			c.replaying = false
-			s.mu.Unlock()
-			return nil
+		if quit {
+			return
 		}
-		c.backlog, c.backlogBytes = nil, 0
+	}
+}
+
+// writePTY writes p to the PTY in small pieces. For a client it stops as soon
+// as the client no longer controls the session; a nil client always writes.
+func (s *server) writePTY(c *client, p []byte) {
+	for len(p) > 0 {
+		n := min(len(p), 4096)
+		s.ptyMu.Lock()
+		ok := c == nil || c.writer.Load()
+		if ok {
+			s.ptmx.Write(p[:n])
+		}
+		s.ptyMu.Unlock()
+		if !ok {
+			return
+		}
+		p = p[n:]
+	}
+}
+
+// signal wakes c's writer.
+func (c *client) signal() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+// sendLocked queues a frame for c. A non-nil error means c should be
+// dropped. The payload is shared and must not be modified afterwards.
+func (s *server) sendLocked(c *client, typ byte, payload []byte) error {
+	if c.queueBytes+len(payload) > maxQueue {
+		return errors.New("client too slow to take its output")
+	}
+	c.queue = append(c.queue, frame{typ, payload})
+	c.queueBytes += len(payload)
+	if !c.replaying {
+		c.signal()
+	}
+	return nil
+}
+
+// finishReplay hands c over to its writer goroutine, which sends what was
+// queued during the replay and everything after it.
+func (s *server) finishReplay(c *client) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !slices.Contains(s.clients, c) {
+		return errors.New("client was dropped")
+	}
+	c.replaying = false
+	go s.writeLoop(c)
+	c.signal()
+	return nil
+}
+
+// writeLoop delivers c's queued frames until c is dropped or the session
+// ends. It is the only goroutine writing to c once the replay is done.
+func (s *server) writeLoop(c *client) {
+	defer close(c.writerDone)
+	for {
+		select {
+		case <-c.wake:
+		case <-c.quit:
+			return
+		}
+		s.mu.Lock()
+		queued, final := c.queue, c.final
+		c.queue, c.queueBytes = nil, 0
+		s.drained.Broadcast()
 		s.mu.Unlock()
 
-		c.conn.SetWriteDeadline(time.Now().Add(s.timeoutFor(c)))
 		for _, f := range queued {
+			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if err := protocol.WriteFrame(c.conn, f.typ, f.payload); err != nil {
-				return err
+				s.mu.Lock()
+				s.dropLocked(c)
+				s.mu.Unlock()
+				return
 			}
+		}
+		if final {
+			return
 		}
 	}
 }
@@ -523,9 +663,10 @@ func (s *server) dropLocked(c *client) {
 	}
 	s.clients = slices.Delete(s.clients, i, i+1)
 	s.nclients.Store(int32(len(s.clients)))
+	close(c.quit)
 	c.conn.Close()
+	s.drained.Broadcast()
 	s.rolesLocked()
-	go s.syncMeta()
 }
 
 // replayLocked returns the scrollback to send to a newly attached client.
@@ -539,16 +680,4 @@ func (s *server) replayLocked() []byte {
 		}
 	}
 	return b
-}
-
-// syncMeta records the current number of clients in session.json.
-func (s *server) syncMeta() {
-	s.metaMu.Lock()
-	defer s.metaMu.Unlock()
-	clients := int(s.nclients.Load())
-	if s.meta.Clients == clients {
-		return
-	}
-	s.meta.Clients = clients
-	session.WriteMeta(s.dir, s.meta)
 }
