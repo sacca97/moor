@@ -21,11 +21,7 @@ import (
 )
 
 const (
-	scrollbackSize = 8 << 20
-	// writeTimeout bounds how long a single write to a client may block
-	// before the client is dropped. Each client has its own writer goroutine,
-	// so a stuck one never holds up the shell or the other clients.
-	writeTimeout     = 10 * time.Second
+	scrollbackSize   = 8 << 20
 	handshakeTimeout = 5 * time.Second
 	replayChunk      = 64 << 10
 	// drainTimeout is how long to wait for remaining PTY output after the
@@ -33,6 +29,11 @@ const (
 	drainTimeout = 250 * time.Millisecond
 	readyFD      = 3
 )
+
+// writeTimeout bounds how long a single write to a client may block before
+// the client is dropped. Each client has its own writer goroutine, so a stuck
+// one never holds up the shell or the other clients. A variable for tests.
+var writeTimeout = 10 * time.Second
 
 // client is one attached terminal. Every client sees the session's output,
 // but only the writer, the most recent client that did not ask to be
@@ -442,11 +443,15 @@ func (s *server) attach(conn net.Conn, hello []byte) {
 	s.mu.Unlock()
 	go s.inputLoop(c)
 
-	conn.SetWriteDeadline(time.Now().Add(writeTimeout + time.Duration(len(replay)>>20)*time.Second))
+	// The deadline applies to each write, not to the whole replay: a terminal
+	// that is slow to render a big scrollback is fine as long as it keeps
+	// taking it.
+	c.armWrite()
 	err = protocol.WriteFrame(conn, protocol.MsgHello,
 		protocol.HelloReply{Role: role, ReplayLen: uint32(len(replay))}.Encode())
 	for len(replay) > 0 && err == nil {
 		n := min(len(replay), replayChunk)
+		c.armWrite()
 		err = protocol.WriteFrame(conn, protocol.MsgOutput, replay[:n])
 		replay = replay[n:]
 	}
@@ -552,6 +557,9 @@ func (s *server) writePTY(c *client, p []byte) {
 	}
 }
 
+// armWrite starts the deadline for the next write to c.
+func (c *client) armWrite() { c.conn.SetWriteDeadline(time.Now().Add(writeTimeout)) }
+
 // signal wakes c's writer.
 func (c *client) signal() {
 	select {
@@ -605,7 +613,7 @@ func (s *server) writeLoop(c *client) {
 		s.mu.Unlock()
 
 		for _, f := range queued {
-			c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			c.armWrite()
 			if err := protocol.WriteFrame(c.conn, f.typ, f.payload); err != nil {
 				s.mu.Lock()
 				s.dropLocked(c)

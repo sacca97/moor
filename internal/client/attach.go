@@ -413,6 +413,13 @@ func (a *attachment) readInput(in *os.File) {
 			a.finish(Outcome{Result: Detached})
 			return
 		}
+		// Another process sharing the terminal (a program that put it in
+		// non-blocking mode, or one that read the byte first) can make a read
+		// after a successful poll fail with EAGAIN. That is not a lost
+		// terminal; poll again.
+		if errors.Is(err, syscall.EAGAIN) {
+			continue
+		}
 		if err != nil {
 			a.finish(Outcome{Result: Lost})
 			return
