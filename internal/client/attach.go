@@ -201,25 +201,65 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	// replay are not mistaken for typing.
 	a.emit([]byte(clearScreen))
 	a.setRole(hello.Role)
-	for remaining := int(hello.ReplayLen); remaining > 0; {
-		typ, payload, err := protocol.ReadFrame(conn)
-		if err != nil {
+	// Read stdin during the replay, discarding the answers as they come.
+	if hello.ReplayLen > 0 {
+		a.drain.start()
+	}
+	inputDone := make(chan struct{})
+	go func() {
+		defer close(inputDone)
+		a.readInput(in)
+	}()
+	stopInput := sync.OnceFunc(func() {
+		quitW.Write([]byte{0})
+		<-inputDone
+	})
+	defer stopInput()
+	// Frames are read off the socket independently of how fast the terminal
+	// takes them. A terminal that needs a long time to digest a big replay
+	// must not make the server time out a write and drop us.
+	type replayFrame struct {
+		typ     byte
+		payload []byte
+		err     error
+	}
+	frames := make(chan replayFrame, int(hello.ReplayLen)/4096+64)
+	go func() {
+		defer close(frames)
+		for remaining := int(hello.ReplayLen); remaining > 0; {
+			typ, payload, err := protocol.ReadFrame(conn)
+			if err != nil {
+				frames <- replayFrame{err: err}
+				return
+			}
+			if typ == protocol.MsgOutput {
+				remaining -= len(payload)
+			}
+			frames <- replayFrame{typ: typ, payload: payload}
+			if typ == protocol.MsgExit {
+				return
+			}
+		}
+	}()
+	for f := range frames {
+		if f.err != nil {
 			return Outcome{Result: Lost}, nil
 		}
-		switch typ {
+		switch f.typ {
 		case protocol.MsgOutput:
-			a.write(payload)
-			remaining -= len(payload)
+			a.write(f.payload)
 		case protocol.MsgRole:
-			if len(payload) == 1 {
-				a.setRole(payload[0])
+			if len(f.payload) == 1 {
+				a.setRole(f.payload[0])
 			}
 		case protocol.MsgExit:
-			return Outcome{Result: Exited, ExitCode: protocol.DecodeExit(payload)}, nil
+			return Outcome{Result: Exited, ExitCode: protocol.DecodeExit(f.payload)}, nil
 		}
 	}
 	if hello.ReplayLen > 0 {
-		a.drain.start()
+		a.mu.Lock()
+		a.drain.arm()
+		a.mu.Unlock()
 		a.emit(drainQuery)
 	}
 
@@ -235,18 +275,12 @@ func Attach(sock string, readOnly bool) (Outcome, error) {
 	}
 
 	go a.readServer()
-	inputDone := make(chan struct{})
-	go func() {
-		defer close(inputDone)
-		a.readInput(in)
-	}()
 
 	o := <-a.done
 	// Whatever ended the attachment, the input reader must be gone before
 	// returning: left on stdin, it would swallow the next thing the user
 	// types, such as the answer to the update prompt.
-	quitW.Write([]byte{0})
-	<-inputDone
+	stopInput()
 	if o.Result == Detached {
 		a.send(protocol.MsgDetach, nil)
 	}

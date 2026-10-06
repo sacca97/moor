@@ -289,12 +289,23 @@ var (
 	drainReply = []byte("\x1b[0n")
 )
 
-const drainTimeout = time.Second
+// drainTimeout is how long, after the status query is sent, to wait for its
+// answer. A terminal chewing through a huge replay answers late.
+const drainTimeout = 5 * time.Second
 
+// start begins discarding input. It runs before the replay is written, so
+// replies to its queries are read as they arrive instead of piling up in the
+// tty input buffer, which drops what does not fit, possibly our own answer.
+// There is no deadline until arm.
 func (d *replyDrain) start() {
 	d.active = true
-	d.deadline = time.Now().Add(drainTimeout)
+	d.deadline = time.Time{}
 	d.buf = nil
+}
+
+// arm starts the clock once the status query has been sent.
+func (d *replyDrain) arm() {
+	d.deadline = time.Now().Add(drainTimeout)
 }
 
 // filter returns the part of p that should be processed as user input.
@@ -302,7 +313,7 @@ func (d *replyDrain) filter(p []byte) []byte {
 	if !d.active {
 		return p
 	}
-	if time.Now().After(d.deadline) {
+	if !d.deadline.IsZero() && time.Now().After(d.deadline) {
 		// The terminal never answered; stop discarding.
 		d.active = false
 		d.buf = nil
